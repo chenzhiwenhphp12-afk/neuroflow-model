@@ -1,242 +1,330 @@
 """
-NeuroFlow 训练脚本
-
-模拟类脑学习过程：
-1. 前向传播 → 显著性检测 → ECN/DMN 协作决策
-2. 反向传播 + 记忆巩固（LTP 模拟）
-3. 神经流形轨迹分析
-
-用法:
-    python scripts/train.py --epochs 50 --batch-size 32 --lr 0.001
+NeuroFlow - 主训练脚本
+支持多种数据集：synthetic, sklearn_digits, mnist_local
 """
 
 import argparse
-import os
-import sys
 import json
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-# 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neuroflow.model import NeuroFlowModel
-
-
-def generate_synthetic_data(
-    n_samples: int = 1000,
-    input_dim: int = 512,
-    output_dim: int = 10,
-    n_classes: int = 10,
-):
-    """
-    生成合成数据集（模拟多模态神经信号）
-    实际使用时替换为真实数据集加载逻辑
-    """
+def load_synthetic_dataset(input_dim=784, n_classes=10, n_samples=5000):
+    """合成数据集，模拟皮层信号输入模式"""
     torch.manual_seed(42)
     X = torch.randn(n_samples, input_dim)
-    # 添加可学习的模式
+    y = torch.randint(0, n_classes, (n_samples,))
+    # 添加类间差异
     for c in range(n_classes):
-        mask = torch.arange(n_samples) % n_classes == c
+        mask = y == c
         X[mask] += torch.randn(input_dim) * 0.5 + c * 0.3
-    y = torch.arange(n_samples) % n_classes
     return X, y
 
 
-def train_epoch(model, loader, optimizer, criterion, device, epoch):
-    """单轮训练 — 包含记忆巩固步骤"""
+def load_digits_dataset():
+    """
+    sklearn digits 数据集 (8x8 手写数字，64 维特征)
+    无需联网下载，本地自带
+    """
+    from sklearn.datasets import load_digits
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    digits = load_digits()
+    X = torch.tensor(digits.data, dtype=torch.float32)
+    y = torch.tensor(digits.target, dtype=torch.long)
+
+    # 上采样到 784 维以匹配 NeuroFlow 输入
+    # 使用零填充 + 随机投影模拟从 64 到 784 的扩展
+    n_samples, n_features = X.shape
+    projection = torch.randn(n_features, 784) * 0.1
+    X = X @ projection
+
+    # 标准化
+    scaler = StandardScaler()
+    X_np = scaler.fit_transform(X.numpy())
+    X = torch.tensor(X_np, dtype=torch.float32)
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    return (X_train, y_train), (X_val, y_val)
+
+
+def load_sklearn_dataset(name="wine"):
+    """sklearn 内置数据集"""
+    from sklearn.datasets import load_wine, load_breast_cancer
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    datasets = {
+        "wine": load_wine,
+        "breast_cancer": load_breast_cancer,
+    }
+    loader = datasets.get(name, load_wine)
+    data = loader()
+    X = torch.tensor(data.data, dtype=torch.float32)
+    y = torch.tensor(data.target, dtype=torch.long)
+
+    scaler = StandardScaler()
+    X_np = scaler.fit_transform(X.numpy())
+    X = torch.tensor(X_np, dtype=torch.float32)
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    return (X_train, y_train), (X_val, y_val)
+
+
+def train_epoch(model, dataloader, optimizer, criterion, device, grad_clip=1.0):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
-    ecn_gates = []
-    dmn_gates = []
 
-    for batch_x, batch_y in loader:
-        batch_x = batch_x.to(device)
-        batch_y = batch_y.to(device)
+    for batch_x, batch_y in dataloader:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
         optimizer.zero_grad()
+        output = model(batch_x)
+        logits = output["decision"]
+        loss = criterion(logits, batch_y)
 
-        # 前向传播
-        result = model(batch_x, consolidate=(epoch % 5 == 0))
-        output = result["output"]
-
-        # 损失计算
-        loss = criterion(output, batch_y)
         loss.backward()
-
-        # 梯度裁剪（模拟突触可塑性上限）
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total_loss += loss.item()
-        _, predicted = output.max(1)
+        total_loss += loss.item() * batch_x.size(0)
+        _, predicted = logits.max(1)
         total += batch_y.size(0)
         correct += predicted.eq(batch_y).sum().item()
 
-        # 记录门控状态（用于分析 ECN/DMN 切换）
-        ecn_gates.append(result["ecn_gate"].mean().item())
-        dmn_gates.append(result["dmn_gate"].mean().item())
-
-    return {
-        "loss": total_loss / len(loader),
-        "accuracy": correct / total,
-        "avg_ecn_gate": sum(ecn_gates) / len(ecn_gates),
-        "avg_dmn_gate": sum(dmn_gates) / len(dmn_gates),
-    }
+    avg_loss = total_loss / total
+    accuracy = correct / total
+    return avg_loss, accuracy
 
 
-def evaluate(model, loader, criterion, device):
-    """评估模型性能"""
+def validate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0
     correct = 0
     total = 0
 
     with torch.no_grad():
-        for batch_x, batch_y in loader:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
+        for batch_x, batch_y in dataloader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            output = model(batch_x)
+            logits = output["decision"]
+            loss = criterion(logits, batch_y)
 
-            result = model(batch_x)
-            output = result["output"]
-            loss = criterion(output, batch_y)
-
-            total_loss += loss.item()
-            _, predicted = output.max(1)
+            total_loss += loss.item() * batch_x.size(0)
+            _, predicted = logits.max(1)
             total += batch_y.size(0)
             correct += predicted.eq(batch_y).sum().item()
 
-    return {
-        "loss": total_loss / len(loader),
-        "accuracy": correct / total,
-    }
+    avg_loss = total_loss / total
+    accuracy = correct / total
+    return avg_loss, accuracy
+
+
+def analyze_network_dynamics(model, dataloader, device, n_batches=5):
+    """分析网络动态：门控模式、能量景观"""
+    model.eval()
+    ecn_activations = []
+    dmn_activations = []
+    sn_gates = []
+
+    with torch.no_grad():
+        for i, (batch_x, _) in enumerate(dataloader):
+            if i >= n_batches:
+                break
+            batch_x = batch_x.to(device)
+            output, dynamics = model(batch_x)
+
+            ecn_activations.append(dynamics["ecn_output"].mean(dim=0))
+            dmn_activations.append(dynamics["dmn_output"].mean(dim=0))
+            sn_gates.append(dynamics["sn_gate"].mean(dim=0))
+
+    ecn_mean = torch.stack(ecn_activations).mean(dim=0)
+    dmn_mean = torch.stack(dmn_activations).mean(dim=0)
+    sn_mean = torch.stack(sn_gates).mean(dim=0)
+
+    print("\n[Network Dynamics Analysis]")
+    print(f"  ECN activation mean: {ecn_mean.mean().item():.4f} (std: {ecn_mean.std().item():.4f})")
+    print(f"  DMN activation mean: {dmn_mean.mean().item():.4f} (std: {dmn_mean.std().item():.4f})")
+    print(f"  SN gate mean:        {sn_mean.mean().item():.4f} (range: [{sn_gates[0].min().item():.4f}, {sn_gates[0].max().item():.4f}])")
+
+
+def print_ascii_image(img_2d):
+    """ASCII 可视化"""
+    chars = " .:-=+*#%@"
+    if hasattr(img_2d, "numpy"):
+        img_2d = img_2d.numpy()
+    img_norm = (img_2d - img_2d.min()) / (img_2d.max() - img_2d.min() + 1e-8)
+    img_ascii = np.char.array([chars[int(v * (len(chars) - 1))] for v in img_norm.flatten()])
+    img_ascii = img_ascii.reshape(img_2d.shape)
+    print("  " + "\n  ".join("".join(row) for row in img_ascii))
+
+
+def analyze_single_sample(model, x, class_names=None):
+    """单样本分析"""
+    model.eval()
+    with torch.no_grad():
+        output, dynamics = model(x)
+
+    probs = torch.softmax(output, dim=1)[0]
+    _, predicted = output.max(1)
+
+    top3_idx = probs.argsort(descending=True)[:3]
+    print(f"  预测: {class_names[predicted.item()] if class_names else predicted.item()}")
+    for idx in top3_idx:
+        print(f"    {class_names[idx] if class_names else idx}: {probs[idx].item():.4f}")
+
+    ecn_energy = dynamics["ecn_output"].pow(2).mean().item()
+    dmn_energy = dynamics["dmn_output"].pow(2).mean().item()
+    sn_gate = dynamics["sn_gate"].mean().item()
+    print(f"  能量: ECN={ecn_energy:.4f}, DMN={dmn_energy:.4f}, SN={sn_gate:.4f}")
+
+
+def trace_manifold(model, x, steps=20):
+    """追踪流形轨迹"""
+    model.eval()
+    with torch.no_grad():
+        _, dynamics = model(x)
+        manifold = dynamics["manifold_projection"]
+
+    trajectory = [manifold.clone()]
+    for _ in range(steps):
+        manifold = model.project_to_manifold(manifold)
+        trajectory.append(manifold.clone())
+
+    return trajectory
+
+
+def print_manifold_summary(trajectory):
+    """打印流形摘要"""
+    print("  流形轨迹:")
+    for i, m in enumerate(trajectory[::5]):
+        print(f"    step {i*5}: mean={m.mean().item():.4f}, std={m.std().item():.4f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train NeuroFlow Model")
+    parser = argparse.ArgumentParser(description="NeuroFlow 训练脚本")
+    parser.add_argument("--config", type=str, default="configs/default.json")
+    parser.add_argument("--dataset", type=str, default="digits",
+                        choices=["synthetic", "digits", "wine", "breast_cancer"])
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--input-dim", type=int, default=512)
-    parser.add_argument("--hidden-dim", type=int, default=256)
-    parser.add_argument("--output-dim", type=int, default=10)
-    parser.add_argument("--memory-slots", type=int, default=64)
-    parser.add_argument("--memory-dim", type=int, default=128)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--save-dir", type=str, default="checkpoints")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--save", type=str, default="neuroflow_checkpoint.pt")
+    parser.add_argument("--analyze", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    # 设备设置
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    print(f"[NeuroFlow] Using device: {device}")
-
     torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[NeuroFlow] Device: {device}")
+    print(f"[NeuroFlow] Dataset: {args.dataset}")
 
-    # 数据集
-    print("[NeuroFlow] Generating synthetic dataset...")
-    X, y = generate_synthetic_data(
-        n_samples=2000,
-        input_dim=args.input_dim,
-        output_dim=args.output_dim,
-    )
+    # 加载配置
+    try:
+        with open(args.config) as f:
+            full_config = json.load(f)
+        # 提取 model 配置
+        config = full_config.get("model", full_config)
+    except FileNotFoundError:
+        print(f"[WARN] Config {args.config} not found, using defaults")
+        config = {}
 
-    # 划分训练/验证集
-    n_train = int(0.8 * len(X))
-    train_dataset = TensorDataset(X[:n_train], y[:n_train])
-    val_dataset = TensorDataset(X[n_train:], y[n_train:])
+    # 加载数据集
+    print(f"\n[NeuroFlow] Loading {args.dataset} dataset...")
+    if args.dataset == "synthetic":
+        X, y = load_synthetic_dataset()
+        n_train = int(0.8 * len(X))
+        train_dataset = TensorDataset(X[:n_train], y[:n_train])
+        val_dataset = TensorDataset(X[n_train:], y[n_train:])
+        input_dim = X.size(1)
+        n_classes = int(y.max().item()) + 1
+
+    elif args.dataset == "digits":
+        (X_train, y_train), (X_val, y_val) = load_digits_dataset()
+        input_dim = X_train.size(1)
+        n_classes = 10
+        train_dataset = TensorDataset(X_train, y_train)
+        val_dataset = TensorDataset(X_val, y_val)
+
+    elif args.dataset in ("wine", "breast_cancer"):
+        (X_train, y_train), (X_val, y_val) = load_sklearn_dataset(args.dataset)
+        input_dim = X_train.size(1)
+        n_classes = int(y_train.max().item()) + 1
+        train_dataset = TensorDataset(X_train, y_train)
+        val_dataset = TensorDataset(X_val, y_val)
+
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
+
+    print(f"[NeuroFlow] Input dim: {input_dim}, Classes: {n_classes}")
+    print(f"[NeuroFlow] Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
-    # 模型
-    print("[NeuroFlow] Initializing model...")
-    model = NeuroFlowModel(
-        input_dim=args.input_dim,
-        hidden_dim=args.hidden_dim,
-        output_dim=args.output_dim,
-        memory_slots=args.memory_slots,
-        memory_dim=args.memory_dim,
-    ).to(device)
+    # 创建模型
+    from neuroflow.model import NeuroFlowModel
+    # config 先加载，然后被显式参数覆盖
+    model_config = dict(config)
+    model_config["input_dim"] = input_dim
+    model_config["output_dim"] = n_classes
+    model = NeuroFlowModel(**model_config).to(device)
 
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[NeuroFlow] Model parameters: {n_params:,}")
+    print(f"\n[NeuroFlow] Model initialized")
+    print(f"[NeuroFlow] Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # 优化器
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+
     criterion = nn.CrossEntropyLoss()
 
     # 训练循环
-    os.makedirs(args.save_dir, exist_ok=True)
-    history = []
-    best_acc = 0
-
     print(f"\n[NeuroFlow] Starting training for {args.epochs} epochs...")
-    print("-" * 60)
+    print(f"{'Epoch':>5} | {'Train Loss':>10} | {'Train Acc':>8} | {'Val Loss':>10} | {'Val Acc':>8} | {'Time':>6}")
+    print("-" * 65)
 
-    start_time = time.time()
+    best_val_acc = 0
     for epoch in range(1, args.epochs + 1):
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, criterion, device, epoch
+        start_time = time.time()
+
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, criterion, device, args.grad_clip
         )
-        val_metrics = evaluate(model, val_loader, criterion, device)
-        scheduler.step()
+        val_loss, val_acc = validate(model, val_loader, criterion, device)
 
         elapsed = time.time() - start_time
-        print(
-            f"  Epoch {epoch:3d}/{args.epochs} | "
-            f"Train Loss: {train_metrics['loss']:.4f} Acc: {train_metrics['accuracy']:.4f} | "
-            f"Val Loss: {val_metrics['loss']:.4f} Acc: {val_metrics['accuracy']:.4f} | "
-            f"ECN: {train_metrics['avg_ecn_gate']:.2f} DMN: {train_metrics['avg_dmn_gate']:.2f} | "
-            f"Time: {elapsed:.1f}s"
-        )
 
-        epoch_record = {
-            "epoch": epoch,
-            "train_loss": train_metrics["loss"],
-            "train_acc": train_metrics["accuracy"],
-            "val_loss": val_metrics["loss"],
-            "val_acc": val_metrics["accuracy"],
-            "ecn_gate": train_metrics["avg_ecn_gate"],
-            "dmn_gate": train_metrics["avg_dmn_gate"],
-            "lr": scheduler.get_last_lr()[0],
-        }
-        history.append(epoch_record)
+        print(f"{epoch:5d} | {train_loss:10.4f} | {train_acc:7.2%} | {val_loss:10.4f} | {val_acc:7.2%} | {elapsed:5.1f}s")
 
-        # 保存最佳模型
-        if val_metrics["accuracy"] > best_acc:
-            best_acc = val_metrics["accuracy"]
-            checkpoint = {
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_acc": best_acc,
-                "config": vars(args),
-            }
-            torch.save(checkpoint, os.path.join(args.save_dir, "best_model.pt"))
-            print(f"  ★ New best model saved (acc: {best_acc:.4f})")
+                "val_acc": val_acc,
+                "config": config,
+            }, args.save)
 
-    # 保存训练历史
-    with open(os.path.join(args.save_dir, "training_history.json"), "w") as f:
-        json.dump(history, f, indent=2)
+    print(f"\n[NeuroFlow] Training complete!")
+    print(f"[NeuroFlow] Best validation accuracy: {best_val_acc:.2%}")
+    print(f"[NeuroFlow] Checkpoint saved to {args.save}")
 
-    print("-" * 60)
-    print(f"[NeuroFlow] Training complete in {time.time() - start_time:.1f}s")
-    print(f"[NeuroFlow] Best validation accuracy: {best_acc:.4f}")
+    # 网络动态分析
+    if args.analyze:
+        print("\n[NeuroFlow] Analyzing network dynamics...")
+        analyze_network_dynamics(model, val_loader, device)
 
 
 if __name__ == "__main__":
