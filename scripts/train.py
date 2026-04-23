@@ -5,9 +5,15 @@ NeuroFlow - 主训练脚本
 
 import argparse
 import json
+import os
+import sys
 import time
 
+# 确保可以导入 neuroflow 和 teacher
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
+import torch.nn.functional as F
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -80,11 +86,18 @@ def load_sklearn_dataset(name="wine"):
     return (X_train, y_train), (X_val, y_val)
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device, grad_clip=1.0):
+def train_epoch(model, dataloader, optimizer, criterion, device, grad_clip=1.0,
+                teacher_fn=None, temperature=2.0, alpha=0.5):
+    """
+    teacher_fn: 函数，接收 batch_x 返回 teacher_logits (batch, n_classes)
+    temperature: 蒸馏温度
+    alpha: 蒸馏权重 (0.0 = 无蒸馏, 1.0 = 纯蒸馏)
+    """
     model.train()
     total_loss = 0
     correct = 0
     total = 0
+    kd_loss_fn = nn.KLDivLoss(reduction="batchmean")
 
     for batch_x, batch_y in dataloader:
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
@@ -92,7 +105,25 @@ def train_epoch(model, dataloader, optimizer, criterion, device, grad_clip=1.0):
         optimizer.zero_grad()
         output = model(batch_x)
         logits = output["decision"]
-        loss = criterion(logits, batch_y)
+
+        # 1. Hard Loss (标准交叉熵)
+        loss_hard = criterion(logits, batch_y)
+        loss = loss_hard
+
+        # 2. Soft Loss (蒸馏)
+        if teacher_fn is not None and alpha < 1.0:
+            with torch.no_grad():
+                teacher_logits = teacher_fn(batch_x).to(device)
+            
+            # 软化分布
+            student_soft = F.log_softmax(logits / temperature, dim=1)
+            teacher_soft = F.softmax(teacher_logits / temperature, dim=1)
+            
+            # KL 散度
+            loss_kd = kd_loss_fn(student_soft, teacher_soft) * (temperature ** 2)
+            
+            # 混合损失
+            loss = alpha * loss_hard + (1 - alpha) * loss_kd
 
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -224,6 +255,12 @@ def main():
     parser.add_argument("--save", type=str, default="neuroflow_checkpoint.pt")
     parser.add_argument("--analyze", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    
+    # 蒸馏参数
+    parser.add_argument("--distill", action="store_true", help="启用知识蒸馏")
+    parser.add_argument("--temperature", type=float, default=2.0, help="蒸馏温度")
+    parser.add_argument("--alpha", type=float, default=0.5, help="Hard Loss 权重 (0.0=纯蒸馏, 1.0=无蒸馏)")
+    parser.add_argument("--teacher-epochs", type=int, default=20, help="教师模型预训练轮数 (仅 distill 模式)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -289,6 +326,30 @@ def main():
 
     criterion = nn.CrossEntropyLoss()
 
+    # 蒸馏设置
+    teacher_fn = None
+    if args.distill:
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from teacher import MLPTeacher, TeacherWrapper, train_teacher
+        print(f"\n[NeuroFlow] Preparing Teacher Model for Distillation...")
+        
+        # 创建教师模型 (更宽的网络)
+        teacher = MLPTeacher(
+            input_dim=input_dim, 
+            hidden_dim=512,  # 教师更宽
+            output_dim=n_classes
+        ).to(device)
+        
+        # 训练教师 (这里为了演示，我们训练一个更强的 MLP)
+        # 在实际应用中，这里应该是加载预训练好的 LLM 权重或 API 调用
+        X_all = torch.cat([train_dataset.tensors[0], val_dataset.tensors[0]])
+        y_all = torch.cat([train_dataset.tensors[1], val_dataset.tensors[1]])
+        train_teacher(teacher, X_all, y_all, epochs=args.teacher_epochs, lr=0.001)
+        
+        teacher_fn = TeacherWrapper(teacher, device)
+        print(f"[NeuroFlow] Teacher Ready. Distillation: alpha={args.alpha}, T={args.temperature}")
+
     # 训练循环
     print(f"\n[NeuroFlow] Starting training for {args.epochs} epochs...")
     print(f"{'Epoch':>5} | {'Train Loss':>10} | {'Train Acc':>8} | {'Val Loss':>10} | {'Val Acc':>8} | {'Time':>6}")
@@ -299,7 +360,8 @@ def main():
         start_time = time.time()
 
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, criterion, device, args.grad_clip
+            model, train_loader, optimizer, criterion, device, args.grad_clip,
+            teacher_fn=teacher_fn, temperature=args.temperature, alpha=args.alpha
         )
         val_loss, val_acc = validate(model, val_loader, criterion, device)
 
