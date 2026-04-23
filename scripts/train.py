@@ -19,6 +19,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 
+class IndexedTensorDataset(TensorDataset):
+    """Returns (x, y, index) tuples"""
+    def __getitem__(self, index):
+        return tuple(tensor[index] for tensor in self.tensors) + (index,)
+
+
 def load_synthetic_dataset(input_dim=784, n_classes=10, n_samples=5000):
     """合成数据集，模拟皮层信号输入模式"""
     torch.manual_seed(42)
@@ -99,7 +105,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device, grad_clip=1.0,
     total = 0
     kd_loss_fn = nn.KLDivLoss(reduction="batchmean")
 
-    for batch_x, batch_y in dataloader:
+    for data in dataloader:
+        if len(data) == 3:
+            batch_x, batch_y, batch_indices = data
+        else:
+            batch_x, batch_y = data
+            batch_indices = None
+        
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
 
         optimizer.zero_grad()
@@ -113,7 +125,13 @@ def train_epoch(model, dataloader, optimizer, criterion, device, grad_clip=1.0,
         # 2. Soft Loss (蒸馏)
         if teacher_fn is not None and alpha < 1.0:
             with torch.no_grad():
-                teacher_logits = teacher_fn(batch_x).to(device)
+                # 如果 teacher 支持 indices 参数 (PrecomputedTeacher)，传入它
+                import inspect
+                sig = inspect.signature(teacher_fn.__call__) if hasattr(teacher_fn, '__call__') else inspect.signature(teacher_fn)
+                if 'indices' in sig.parameters:
+                    teacher_logits = teacher_fn(batch_x, indices=batch_indices).to(device)
+                else:
+                    teacher_logits = teacher_fn(batch_x).to(device)
             
             # 软化分布
             student_soft = F.log_softmax(logits / temperature, dim=1)
@@ -146,7 +164,11 @@ def validate(model, dataloader, criterion, device):
     total = 0
 
     with torch.no_grad():
-        for batch_x, batch_y in dataloader:
+        for data in dataloader:
+            if len(data) == 3:
+                batch_x, batch_y, _ = data
+            else:
+                batch_x, batch_y = data
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             output = model(batch_x)
             logits = output["decision"]
@@ -170,9 +192,13 @@ def analyze_network_dynamics(model, dataloader, device, n_batches=5):
     sn_gates = []
 
     with torch.no_grad():
-        for i, (batch_x, _) in enumerate(dataloader):
+        for i, data in enumerate(dataloader):
             if i >= n_batches:
                 break
+            if len(data) == 3:
+                batch_x, _, _ = data
+            else:
+                batch_x, _ = data
             batch_x = batch_x.to(device)
             output, dynamics = model(batch_x)
 
@@ -261,6 +287,7 @@ def main():
     parser.add_argument("--temperature", type=float, default=2.0, help="蒸馏温度")
     parser.add_argument("--alpha", type=float, default=0.5, help="Hard Loss 权重 (0.0=纯蒸馏, 1.0=无蒸馏)")
     parser.add_argument("--teacher-epochs", type=int, default=20, help="教师模型预训练轮数 (仅 distill 模式)")
+    parser.add_argument("--teacher-logits-file", type=str, default=None, help="预计算的教师软标签文件 (.pt)")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -283,8 +310,8 @@ def main():
     if args.dataset == "synthetic":
         X, y = load_synthetic_dataset()
         n_train = int(0.8 * len(X))
-        train_dataset = TensorDataset(X[:n_train], y[:n_train])
-        val_dataset = TensorDataset(X[n_train:], y[n_train:])
+        train_dataset = IndexedTensorDataset(X[:n_train], y[:n_train])
+        val_dataset = IndexedTensorDataset(X[n_train:], y[n_train:])
         input_dim = X.size(1)
         n_classes = int(y.max().item()) + 1
 
@@ -292,15 +319,15 @@ def main():
         (X_train, y_train), (X_val, y_val) = load_digits_dataset()
         input_dim = X_train.size(1)
         n_classes = 10
-        train_dataset = TensorDataset(X_train, y_train)
-        val_dataset = TensorDataset(X_val, y_val)
+        train_dataset = IndexedTensorDataset(X_train, y_train)
+        val_dataset = IndexedTensorDataset(X_val, y_val)
 
     elif args.dataset in ("wine", "breast_cancer"):
         (X_train, y_train), (X_val, y_val) = load_sklearn_dataset(args.dataset)
         input_dim = X_train.size(1)
         n_classes = int(y_train.max().item()) + 1
-        train_dataset = TensorDataset(X_train, y_train)
-        val_dataset = TensorDataset(X_val, y_val)
+        train_dataset = IndexedTensorDataset(X_train, y_train)
+        val_dataset = IndexedTensorDataset(X_val, y_val)
 
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
@@ -331,24 +358,29 @@ def main():
     if args.distill:
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from teacher import MLPTeacher, TeacherWrapper, train_teacher
-        print(f"\n[NeuroFlow] Preparing Teacher Model for Distillation...")
+        from teacher import MLPTeacher, TeacherWrapper, PrecomputedTeacher, train_teacher
         
-        # 创建教师模型 (更宽的网络)
-        teacher = MLPTeacher(
-            input_dim=input_dim, 
-            hidden_dim=512,  # 教师更宽
-            output_dim=n_classes
-        ).to(device)
-        
-        # 训练教师 (这里为了演示，我们训练一个更强的 MLP)
-        # 在实际应用中，这里应该是加载预训练好的 LLM 权重或 API 调用
-        X_all = torch.cat([train_dataset.tensors[0], val_dataset.tensors[0]])
-        y_all = torch.cat([train_dataset.tensors[1], val_dataset.tensors[1]])
-        train_teacher(teacher, X_all, y_all, epochs=args.teacher_epochs, lr=0.001)
-        
-        teacher_fn = TeacherWrapper(teacher, device)
-        print(f"[NeuroFlow] Teacher Ready. Distillation: alpha={args.alpha}, T={args.temperature}")
+        if args.teacher_logits_file:
+            # 模式 1: 使用预计算的软标签 (适合 LLM)
+            print(f"\n[NeuroFlow] Loading Precomputed Teacher Logits from {args.teacher_logits_file}...")
+            teacher_fn = PrecomputedTeacher(args.teacher_logits_file)
+            print(f"[NeuroFlow] Precomputed Teacher Ready. Shape: {teacher_fn.logits.shape}")
+        else:
+            # 模式 2: 本地 MLP 教师
+            print(f"\n[NeuroFlow] Preparing Local MLP Teacher Model for Distillation...")
+            teacher = MLPTeacher(
+                input_dim=input_dim, 
+                hidden_dim=512,
+                output_dim=n_classes
+            ).to(device)
+            
+            # 训练教师
+            X_all = torch.cat([train_dataset.tensors[0], val_dataset.tensors[0]])
+            y_all = torch.cat([train_dataset.tensors[1], val_dataset.tensors[1]])
+            train_teacher(teacher, X_all, y_all, epochs=args.teacher_epochs, lr=0.001)
+            
+            teacher_fn = TeacherWrapper(teacher, device)
+            print(f"[NeuroFlow] MLP Teacher Ready. Distillation: alpha={args.alpha}, T={args.temperature}")
 
     # 训练循环
     print(f"\n[NeuroFlow] Starting training for {args.epochs} epochs...")
