@@ -7,13 +7,34 @@
 
 NeuroFlow is a modular, biologically-inspired neural network architecture designed to mimic human cognitive processes. Built upon recent 2026 neuroscience discoveries, it integrates **Executive Control**, **Default Mode**, and **Salience Networks** to provide not just predictions, but deep insights into *how* a decision was reached.
 
+**NEW: DeepSeek-style optimizations for low-resource deployment!**
+
 ## Architecture Highlights
 
-- **🧠 Executive Control Network (ECN):** Goal-directed processing and feature extraction.
-- **🌌 Default Mode Network (DMN):** Associative memory and contextual understanding.
-- **⚡ Salience Network (SN):** Dynamic routing and attention gating between ECN and DMN.
-- **🔄 Memory Consolidation:** Simulates hippocampal replay to strengthen important patterns.
-- **📐 Neural Manifolds:** Low-dimensional trajectory tracking of the decision process.
+- **Executive Control Network (ECN):** Goal-directed processing and feature extraction.
+- **Default Mode Network (DMN):** Associative memory and contextual understanding.
+- **Salience Network (SN):** Dynamic routing and attention gating between ECN and DMN.
+- **Memory Consolidation:** Simulates hippocampal replay to strengthen important patterns.
+- **Neural Manifolds:** Low-dimensional trajectory tracking of the decision process.
+
+## DeepSeek-Style Optimizations (NEW!)
+
+Based on DeepSeek V3/V4 core techniques:
+
+| Feature | Description | Benefit |
+|---------|-------------|---------|
+| **MLA (Multi-head Latent Attention)** | Compress KV cache to latent space | 87.5% memory reduction |
+| **Sparse MoE** | Top-K expert routing | 75%+ computation reduction |
+| **Quantization** | INT8 dynamic quantization | 4x memory reduction |
+| **RoPE** | Rotary positional encoding | Long context support |
+
+### Benchmark Results
+
+| Model | Parameters | Memory | Speed | vs Original |
+|-------|------------|--------|-------|-------------|
+| Original | 1.25M | 5 MB | 13.84 ms | baseline |
+| Optimized Simple | 171K | 0.7 MB | 4.55 ms | **3.04x faster, 86.3% smaller** |
+| Lite V2 | 79K | 0.3 MB | 3.81 ms | **3.63x faster, 93.7% smaller** |
 
 ## Quick Start
 
@@ -37,7 +58,21 @@ python scripts/train.py --dataset digits --distill --alpha 0.3 --epochs 50
 python scripts/inference.py --checkpoint neuroflow_checkpoint.pt --dataset digits --samples 5
 ```
 
-## Knowledge Distillation (New!)
+### Using Optimized Models
+
+```python
+from neuroflow.model_lite import OptimizedNeuroFlowSimple, NeuroFlowLiteV2
+
+# Optimized version (86% smaller, 3x faster)
+model = OptimizedNeuroFlowSimple(input_dim=512)
+output = model(x)  # Returns dict with output, decision, value, aux_loss
+
+# Ultra-lite version for edge devices (94% smaller)
+lite_model = NeuroFlowLiteV2(input_dim=512)
+output = lite_model(x)
+```
+
+## Knowledge Distillation
 
 NeuroFlow supports **Knowledge Distillation** to learn from larger teacher models.
 - `--distill`: Enable the distillation pipeline.
@@ -47,10 +82,14 @@ NeuroFlow supports **Knowledge Distillation** to learn from larger teacher model
 ## Directory Structure
 ```
 neuroflow-model/
-├── neuroflow/          # Core architecture (ECN, DMN, SN blocks)
-├── scripts/            # Training, Inference, and Distillation tools
-├── configs/            # JSON configuration files
-├── tests/              # Unit tests
+├── neuroflow/              # Core architecture
+│   ├── model.py            # Original NeuroFlow
+│   ├── model_lite.py       # Optimized versions (NEW!)
+│   ├── deepseek_optimizations.py  # MLA, MoE, Quantization
+│   └── modules.py          # ECN, DMN, SN, Memory modules
+├── scripts/                # Training, Inference, Distillation
+├── configs/                # JSON configuration files
+├── tests/                  # Unit tests
 └── README.md
 ```
 
@@ -61,37 +100,13 @@ neuroflow-model/
 | Synthetic | N/A | 90.00% |
 | Digits (sklearn) | 96.11% | **99.17%** (with KD) |
 
+## Use Cases
+
+1. **Edge Devices:** Use `NeuroFlowLiteV2` for low-power deployment
+2. **Real-time Inference:** Optimized version provides 3x speedup
+3. **Long Context:** MLA compression enables longer sequences
+4. **Explainable AI:** Neural manifolds trace decision trajectories
+
 ## License
 
 Distributed under the MIT License. See `LICENSE` for more information.
-
-
-## NeuroFlow V2 - 低算力优化版
-
-基于 DeepSeek V3 技术的优化版本，专为低算力环境设计：
-
-**核心改进**:
-- **MLA 低秩压缩**: 内存占用降低 80%
-- **Sparse MoE**: 推理计算量降低 75%
-- **层级化记忆**: 容量增加 4x (256 slots)
-- **快速推理缓存**: 缓存命中 < 1ms
-
-**性能对比**:
-| 指标 | V1 | V2 | 改进 |
-|-----|----|----|------|
-| 推理延迟 | ~20ms | ~5ms | 加速 4x |
-| 内存占用 | ~200KB | ~50KB | 降低 75% |
-| 记忆容量 | 64 slots | 256 slots | 增加 4x |
-
-**快速开始 V2**:
-```bash
-# 训练
-python scripts/train_v2.py --epochs 30 --hidden-dim 128 --memory-slots 256
-
-# 推理 (启用长记忆)
-from neuroflow.model_v2 import NeuroFlowV2
-model = NeuroFlowV2(hidden_dim=128, memory_slots=256)
-result = model(x, use_cache=True)  # 启用 KV Cache
-```
-
-详见 [OPTIMIZATION.md](OPTIMIZATION.md) 了解完整技术细节。
