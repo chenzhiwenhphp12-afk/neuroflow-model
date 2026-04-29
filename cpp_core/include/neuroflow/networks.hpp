@@ -112,7 +112,7 @@ public:
         }
     }
     
-    Tensor forward(Tensor& input) {
+    Tensor forward(Tensor input) {  // 接受值拷贝，避免临时对象问题
         Tensor output = input.clone();
         TensorOps::layer_norm(output, weight, bias, eps);
         return output;
@@ -124,7 +124,7 @@ public:
  */
 class GELU {
 public:
-    Tensor forward(Tensor& input) {
+    Tensor forward(Tensor input) {
         Tensor output = input.clone();
         TensorOps::gelu(output);
         return output;
@@ -141,7 +141,7 @@ public:
     
     Dropout(float r = 0.1f) : rate(r), training(false) {}
     
-    Tensor forward(Tensor& input) {
+    Tensor forward(Tensor input) {
         Tensor output = input.clone();
         TensorOps::dropout(output, rate, training);
         return output;
