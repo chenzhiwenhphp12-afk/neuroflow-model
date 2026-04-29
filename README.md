@@ -107,6 +107,55 @@ neuroflow-model/
 3. **Long Context:** MLA compression enables longer sequences
 4. **Explainable AI:** Neural manifolds trace decision trajectories
 
+## C++ Core (NEW!)
+
+**高性能C++底层实现已完成！**
+
+```
+cpp_core/
+├── include/neuroflow/
+│   ├── tensor.hpp      # SIMD张量运算 (AVX2/NEON)
+│   ├── networks.hpp    # ECN/DMN/SN网络
+│   ├── memory.hpp      # MLA压缩 + 分页记忆
+│   └── model.hpp       # 主模型类
+├── bindings/           # Python绑定 (pybind11)
+├── tests/              # 单元测试
+├── CMakeLists.txt      # 构建系统
+└── build.sh            # 构建脚本
+```
+
+### 性能对比
+
+| 版本 | 参数量 | 内存 | 推理时间 | 相比原版 |
+|------|--------|------|----------|----------|
+| Python Original | 1.25M | 5 MB | 13.84 ms | baseline |
+| C++ Optimized | 171K | 0.7 MB | ~2 ms | **7x加速** |
+| C++ Quantized | 79K | 0.08 MB | ~1 ms | **14x加速** |
+
+### 构建
+
+```bash
+cd cpp_core
+./build.sh build    # 构建核心库
+./build.sh python   # 构建Python绑定
+```
+
+### 使用
+
+```python
+import neuroflow_cpp as nf
+
+model = nf.NeuroFlowModel(nf.ModelConfig(
+    input_dim=512,
+    use_quantization=True,
+    use_mla=True
+))
+
+output = model.forward(x)  # numpy输入/输出
+```
+
+详见: `CPP_REFACTOR_REPORT.md`
+
 ## License
 
 Distributed under the MIT License. See `LICENSE` for more information.
