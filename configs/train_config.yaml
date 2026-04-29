@@ -1,0 +1,54 @@
+# NeuroFlow 训练配置
+
+# 任务类型
+task: classification
+
+# 模型参数
+model:
+  input_dim: 512
+  hidden_dim: 256
+  output_dim: 10
+  memory_dim: 128
+  memory_slots: 64
+  num_layers: 2
+  num_associations: 8
+
+# 多模态参数
+multimodal:
+  text_dim: 512
+  image_size: 224
+  patch_size: 16
+  vision_depth: 2
+  fusion_dim: 256
+
+# 数据参数
+data:
+  num_samples: 10000
+  train_ratio: 0.8
+  batch_size: 32
+
+# 训练参数
+training:
+  epochs: 50
+  lr: 0.0001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  warmup_steps: 100
+  
+  optimizer: adamw
+  scheduler: cosine
+  
+  consolidate: true
+  log_interval: 5
+
+# 保存参数
+save:
+  save_dir: checkpoints
+  save_best: true
+  export_cpp: true
+
+# 设备
+device: auto
+
+# 随机种子
+seed: 42

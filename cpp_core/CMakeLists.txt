@@ -97,6 +97,11 @@ if(NEUROFLOW_BUILD_TESTS)
     target_link_libraries(neuroflow_multimodal_test PRIVATE neuroflow_core)
     add_test(NAME multimodal_test COMMAND neuroflow_multimodal_test)
     
+    # 在线学习测试
+    add_executable(neuroflow_online_test tests/test_online.cpp)
+    target_link_libraries(neuroflow_online_test PRIVATE neuroflow_core)
+    add_test(NAME online_test COMMAND neuroflow_online_test)
+    
     message(STATUS "Unit tests enabled")
 endif()
 
