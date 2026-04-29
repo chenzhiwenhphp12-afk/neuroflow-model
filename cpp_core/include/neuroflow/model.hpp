@@ -185,32 +185,40 @@ public:
             memory->consolidate(h);
         }
         
-        // 门控加权
-        Tensor ecn_weighted = out.decision.clone();
-        Tensor dmn_weighted = dmn_out.vision.reshape({batch, dmn_out.vision.shape[1]});
-        // 只取output_dim部分 (截取，不是reshape)
-        if (dmn_weighted.shape[1] > config.output_dim) {
-            Tensor truncated({batch, config.output_dim}, QuantType::FP32);
-            float* tw = truncated.as_fp32();
-            float* dw = dmn_weighted.as_fp32();
-            for (size_t i = 0; i < batch; ++i) {
-                for (size_t j = 0; j < config.output_dim; ++j) {
-                    tw[i * config.output_dim + j] = dw[i * dmn_weighted.shape[1] + j];
-                }
-            }
-            dmn_weighted = truncated;
-        }
+        // 门控加权 - 创建新的张量，避免修改共享数据
+        Tensor ecn_weighted({batch, config.output_dim}, QuantType::FP32);
+        Tensor dmn_weighted_full({batch, dmn_out.vision.shape[1]}, QuantType::FP32);
         
+        float* ew = ecn_weighted.as_fp32();
+        float* dw = dmn_weighted_full.as_fp32();
+        float* ed = out.decision.as_fp32();
+        float* dv = dmn_out.vision.as_fp32();
         float* eg = ecn_gate.as_fp32();
         float* dg = dmn_gate.as_fp32();
-        float* ew = ecn_weighted.as_fp32();
-        float* dw = dmn_weighted.as_fp32();
         
+        // ECN加权
         for (size_t i = 0; i < batch; ++i) {
             for (size_t j = 0; j < config.output_dim; ++j) {
-                ew[i * config.output_dim + j] *= eg[i];
-                if (j < dmn_weighted.shape[1]) {
-                    dw[i * dmn_weighted.shape[1] + j] *= dg[i];
+                ew[i * config.output_dim + j] = ed[i * config.output_dim + j] * eg[i];
+            }
+        }
+        
+        // DMN加权
+        for (size_t i = 0; i < batch; ++i) {
+            for (size_t j = 0; j < dmn_out.vision.shape[1]; ++j) {
+                dw[i * dmn_out.vision.shape[1] + j] = dv[i * dmn_out.vision.shape[1] + j] * dg[i];
+            }
+        }
+        
+        // 只取output_dim部分
+        Tensor dmn_weighted({batch, config.output_dim}, QuantType::FP32);
+        float* dwf = dmn_weighted.as_fp32();
+        for (size_t i = 0; i < batch; ++i) {
+            for (size_t j = 0; j < config.output_dim; ++j) {
+                if (j < dmn_out.vision.shape[1]) {
+                    dwf[i * config.output_dim + j] = dw[i * dmn_out.vision.shape[1] + j];
+                } else {
+                    dwf[i * config.output_dim + j] = 0.0f;
                 }
             }
         }

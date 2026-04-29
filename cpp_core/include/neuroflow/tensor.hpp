@@ -109,6 +109,11 @@ public:
         return reinterpret_cast<const float*>(data.get());
     }
     
+    // 别名，兼容性
+    const float* as_fp32_const() const {
+        return as_fp32();
+    }
+    
     // INT8数据访问
     int8_t* as_int8() {
         if (dtype != QuantType::INT8) throw std::runtime_error("Not INT8 tensor");

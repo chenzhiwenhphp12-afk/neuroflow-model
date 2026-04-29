@@ -30,8 +30,8 @@ public:
         size_t batch = pred.shape[0];
         size_t classes = pred.shape[1];
         
-        float* p = pred.as_fp32();
-        float* t = target.as_fp32();
+        const float* p = pred.as_fp32();
+        const float* t = target.as_fp32();
         
         float loss = 0.0f;
         for (size_t b = 0; b < batch; ++b) {
@@ -66,8 +66,8 @@ public:
     static float mse(const Tensor& pred, const Tensor& target) {
         size_t n = pred.numel();
         
-        float* p = pred.as_fp32();
-        float* t = target.as_fp32();
+        const float* p = pred.as_fp32();
+        const float* t = target.as_fp32();
         
         float loss = 0.0f;
         for (size_t i = 0; i < n; ++i) {
@@ -135,9 +135,9 @@ public:
         grads.weight_grad = Tensor({out_f, in_f}, QuantType::FP32);
         grads.input_grad = Tensor({batch, in_f}, QuantType::FP32);
         
-        float* inp = input.as_fp32();
-        float* og = output_grad.as_fp32();
-        float* w = weight.as_fp32();
+        const float* inp = input.as_fp32();
+        const float* og = output_grad.as_fp32();
+        const float* w = weight.as_fp32();
         float* wg = grads.weight_grad.as_fp32();
         float* ig = grads.input_grad.as_fp32();
         
@@ -179,8 +179,8 @@ public:
         
         Tensor input_grad({batch, dim}, QuantType::FP32);
         
-        float* inp = input.as_fp32();
-        float* og = output_grad.as_fp32();
+        const float* inp = input.as_fp32();
+        const float* og = output_grad.as_fp32();
         float* ig = input_grad.as_fp32();
         
         for (size_t b = 0; b < batch; ++b) {
@@ -223,8 +223,8 @@ public:
         
         Tensor input_grad(input.shape, QuantType::FP32);
         
-        float* inp = input.as_fp32();
-        float* og = output_grad.as_fp32();
+        const float* inp = input.as_fp32();
+        const float* og = output_grad.as_fp32();
         float* ig = input_grad.as_fp32();
         
         for (size_t i = 0; i < n; ++i) {
@@ -254,7 +254,7 @@ public:
         if (param.shape != grad.shape) return;
         
         float* p = param.as_fp32();
-        float* g = grad.as_fp32();
+        const float* g = grad.as_fp32();
         
         for (size_t i = 0; i < param.numel(); ++i) {
             p[i] -= lr * (g[i] + weight_decay * p[i]);
@@ -285,7 +285,7 @@ public:
         state.t++;
         
         float* p = param.as_fp32();
-        float* g = grad.as_fp32();
+        const float* g = grad.as_fp32();
         float* m = state.m.as_fp32();
         float* v = state.v.as_fp32();
         
@@ -350,7 +350,7 @@ public:
             // 简化梯度：假设最后一层是Linear
             Tensor output_grad({input.shape[0], target.shape[1]}, QuantType::FP32);
             const float* pg = pred.as_fp32();
-            const float* tg = target.as_fp32_const();
+            const float* tg = target.as_fp32();
             float* og = output_grad.as_fp32();
             
             // MSE梯度: 2 * (pred - target) / n
