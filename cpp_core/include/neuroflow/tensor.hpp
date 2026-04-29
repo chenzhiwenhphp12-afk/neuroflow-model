@@ -165,6 +165,13 @@ public:
     static void gemm(const Tensor& A, const Tensor& B, Tensor& C,
                      bool transA = false, bool transB = false,
                      float alpha = 1.0f, float beta = 0.0f) {
+        // 维度检查
+        size_t K_A = transA ? A.shape[0] : A.shape[1];
+        size_t K_B = transB ? B.shape[1] : B.shape[0];
+        if (K_A != K_B) {
+            throw std::runtime_error("GEMM dimension mismatch: K dimensions don't match");
+        }
+        
         if (A.dtype != QuantType::FP32 || B.dtype != QuantType::FP32) {
             quantized_gemm(A, B, C);
             return;

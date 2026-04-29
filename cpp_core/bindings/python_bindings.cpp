@@ -26,7 +26,7 @@ Tensor numpy_to_tensor(py::array_t<float> arr) {
     for (auto dim : buf.shape) shape.push_back(static_cast<size_t>(dim));
     
     Tensor t(shape, QuantType::FP32);
-    float* data = t.as_fp32();
+    float* data = t.as_fp32();  // 新创建的Tensor，可以用非const指针
     float* src = static_cast<float*>(buf.ptr);
     
     memcpy(data, src, t.data_size);
@@ -43,7 +43,7 @@ py::array_t<float> tensor_to_numpy(const Tensor& t) {
     std::vector<ssize_t> shape;
     for (auto dim : t.shape) shape.push_back(static_cast<ssize_t>(dim));
     
-    float* data = t.as_fp32();
+    const float* data = t.as_fp32();
     
     // 创建numpy数组并拷贝数据
     py::array_t<float> arr(shape);
@@ -53,7 +53,7 @@ py::array_t<float> tensor_to_numpy(const Tensor& t) {
     return arr;
 }
 
-PYBIND11_MODULE(neuroflow_cpp, m) {
+PYBIND11_MODULE(neuroflow_python, m) {
     m.doc() = "NeuroFlow C++ Core - Lightweight Brain-Inspired Neural Network";
     
     // 版本
