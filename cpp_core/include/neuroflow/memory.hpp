@@ -127,12 +127,26 @@ public:
         // 解压K, V
         size_t total_len = use_cache && cache_len > 0 ? (cache_len + seq_len) : seq_len;
         
-        // 正确reshape c_kv到二维
+        // 正确reshape c_kv到二维 - 注意batch维度处理
+        // 当有历史cache时，c_kv 被 reshape 到 {1, new_len, d_latent}
+        // 需要正确处理batch扩展
+        size_t c_kv_batch = use_cache && cache_len > 0 ? 1 : batch;
+        size_t actual_elements = c_kv_batch * total_len * d_latent;
+        
         Tensor c_kv_flat({batch * total_len, d_latent}, QuantType::FP32);
         float* ckf = c_kv_flat.as_fp32();
-        float* ck = c_kv.as_fp32();
-        for (size_t i = 0; i < batch * total_len * d_latent; ++i) {
-            ckf[i] = ck[i];
+        const float* ck = c_kv.as_fp32();
+        
+        // 正确拷贝：只拷贝实际存在的数据
+        for (size_t b = 0; b < batch; ++b) {
+            for (size_t t = 0; t < total_len; ++t) {
+                for (size_t d = 0; d < d_latent; ++d) {
+                    // 当有历史cache时，所有batch共享同一份cache数据
+                    size_t src_idx = (c_kv_batch == 1 ? t : b * total_len + t) * d_latent + d;
+                    size_t dst_idx = (b * total_len + t) * d_latent + d;
+                    ckf[dst_idx] = ck[src_idx];
+                }
+            }
         }
         
         Tensor k = W_uk->forward(c_kv_flat);

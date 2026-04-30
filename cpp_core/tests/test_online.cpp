@@ -67,8 +67,11 @@ void test_online_learning_capability() {
     // 计算初始损失
     float initial_loss = LossFunctions::mse(output.output, target);
     
-    // 执行记忆巩固
-    model.memory->consolidate(input);
+    // 执行记忆巩固 - 使用 hidden_dim 而非原始 input
+    Tensor h_input(std::vector<size_t>{1, cfg.hidden_dim}, QuantType::FP32);
+    float* h_inp = h_input.as_fp32();
+    for (size_t i = 0; i < cfg.hidden_dim; ++i) h_inp[i] = inp[i % cfg.input_dim] * 0.5f;
+    model.memory->consolidate(h_input);
     
     // 再次前向传播
     NeuroFlowModel::Output output2 = model.forward(input);
@@ -96,7 +99,7 @@ void test_knowledge_injection() {
     NeuroFlowModel::Config cfg;
     NeuroFlowModel model(cfg);
     
-    // 模拟知识注入（使用记忆巩固）
+    // 模拟知识注入（使用记忆巩固）- 使用 hidden_dim 维度
     Tensor knowledge(std::vector<size_t>{32, cfg.hidden_dim}, QuantType::FP32);
     
     // 执行多次记忆巩固

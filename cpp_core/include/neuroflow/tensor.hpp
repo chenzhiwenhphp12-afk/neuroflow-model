@@ -18,6 +18,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <algorithm>
+#include <iostream>
 
 #ifdef __AVX2__
 #include <immintrin.h>

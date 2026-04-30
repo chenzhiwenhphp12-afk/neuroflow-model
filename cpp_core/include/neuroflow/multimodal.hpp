@@ -45,6 +45,10 @@ public:
         : image_size(img_size), patch_size(patch), 
           in_channels(channels), embed_dim(embed) {
         
+        // 边界检查：确保 image_size >= patch 且能整除
+        if (img_size < patch || img_size % patch != 0) {
+            throw std::invalid_argument("image_size must be >= patch_size and divisible by patch_size");
+        }
         num_patches = (img_size / patch) * (img_size / patch);
         
         // 投影: patch_size*patch_size*channels -> embed_dim
@@ -145,6 +149,10 @@ public:
         // Patch embedding
         patch_embed = std::make_shared<PatchEmbedding>(img_size, patch, 3, embed);
         
+        // 边界检查：确保 embed >= heads
+        if (embed < heads || embed % heads != 0) {
+            throw std::invalid_argument("embed_dim must be >= num_heads and divisible by num_heads");
+        }
         // Transformer层 (简化版)
         size_t head_dim = embed / heads;
         
