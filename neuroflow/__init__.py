@@ -59,28 +59,52 @@ except ImportError:
     NeuroFlowModel = _PyNeuroFlowModel
     NeuroFlowLite = NeuroFlowModelLite
 
-# ---- Python Modules (always available) ----
-from neuroflow.deepseek_optimizations import (
-    LatentKVCompression,
-    SparseMoE,
-    RotaryPositionalEmbedding,
-    QuantizedLinear,
-    quantize_model,
-    EfficientMemoryModule,
-    OptimizedECN,
-)
+# ---- Python Modules (optional — requires torch) ----
+try:
+    from neuroflow.deepseek_optimizations import (
+        LatentKVCompression,
+        SparseMoE,
+        RotaryPositionalEmbedding,
+        QuantizedLinear,
+        quantize_model,
+        EfficientMemoryModule,
+        OptimizedECN,
+    )
+    _HAS_DEEPSEEK = True
+except ImportError:
+    _HAS_DEEPSEEK = False
+    LatentKVCompression = None
+    SparseMoE = None
+    RotaryPositionalEmbedding = None
+    QuantizedLinear = None
+    quantize_model = None
+    EfficientMemoryModule = None
+    OptimizedECN = None
 
-from neuroflow.deepseek_v4_optimizations import (
-    EngramMemory,
-    EngramConfig,
-    MuonOptimizer,
-    FlashAttentionV4,
-    RotaryPositionalEmbeddingV4,
-    MultiHyperConnection,
-    IterativeSelfCorrection,
-    EAGLESpeculativeDecoding,
-    NeuroFlowV4,
-)
+try:
+    from neuroflow.deepseek_v4_optimizations import (
+        EngramMemory,
+        EngramConfig,
+        MuonOptimizer,
+        FlashAttentionV4,
+        RotaryPositionalEmbeddingV4,
+        MultiHyperConnection,
+        IterativeSelfCorrection,
+        EAGLESpeculativeDecoding,
+        NeuroFlowV4,
+    )
+    _HAS_DEEPSEEK_V4 = True
+except ImportError:
+    _HAS_DEEPSEEK_V4 = False
+    EngramMemory = None
+    EngramConfig = None
+    MuonOptimizer = None
+    FlashAttentionV4 = None
+    RotaryPositionalEmbeddingV4 = None
+    MultiHyperConnection = None
+    IterativeSelfCorrection = None
+    EAGLESpeculativeDecoding = None
+    NeuroFlowV4 = None
 
 
 def get_backend():

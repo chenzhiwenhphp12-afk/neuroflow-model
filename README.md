@@ -194,6 +194,20 @@ output = model.forward_multimodal(text_features, image_data)
 
 ---
 
+## 🚀 部署
+
+完整部署手册（Linux / macOS / Windows / Docker / GPU）：**[📖 DEPLOYMENT.md](DEPLOYMENT.md)**
+
+```bash
+# 一键部署
+bash scripts/deploy.sh
+
+# 或 pip 安装
+pip install git+https://github.com/chenzhiwenhphp12-afk/neuroflow-model.git
+```
+
+---
+
 ## 📁 项目结构
 
 ```

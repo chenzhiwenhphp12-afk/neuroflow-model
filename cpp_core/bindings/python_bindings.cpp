@@ -53,7 +53,7 @@ py::array_t<float> tensor_to_numpy(const Tensor& t) {
     return arr;
 }
 
-PYBIND11_MODULE(neuroflow_python, m) {
+PYBIND11_MODULE(_core, m) {
     m.doc() = "NeuroFlow C++ Core - Lightweight Brain-Inspired Neural Network";
     
     // 版本
