@@ -113,6 +113,7 @@ def get_backend():
 
 
 from neuroflow.decoder import TextDecoder, TokenSampler
+from neuroflow.cognition import ReasoningLoop, SelfEvolution, AutonomousAgent
 
 __all__ = [
     # Version & backend
