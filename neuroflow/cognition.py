@@ -70,6 +70,11 @@ class ReasoningLoop:
         self.working_memory = deque(maxlen=working_memory_size)
         self.reasoning_depth = 0
 
+    def _forward(self, x):
+        if hasattr(self.model, 'forward_text'):
+            return self.model.forward_text(x)
+        return self._forward(x)
+
     def reason(
         self,
         x: np.ndarray,
@@ -99,7 +104,7 @@ class ReasoningLoop:
 
         for step in range(max_steps):
             # 1. NeuroFlow 前向传播
-            output = self.model.forward(current_input, consolidate=False)
+            output = self._forward(current_input)
 
             decision = output.decision.copy()
             value = output.value.copy()
@@ -251,6 +256,11 @@ class SelfEvolution:
         self.total_reward = 0.0
         self.avg_reward = 0.0
 
+    def _forward(self, x):
+        if hasattr(self.model, 'forward_text'):
+            return self.model.forward_text(x)
+        return self._forward(x)
+
     def learn(self, x: np.ndarray, target_reward: float = 0.5):
         """
         单次学习：存储经验 + 在线更新。
@@ -260,7 +270,7 @@ class SelfEvolution:
             target_reward: 目标奖励（由外部环境给出）
         """
         # 前向
-        output = self.model.forward(x)
+        output = self._forward(x)
         decision = output.decision.copy()
 
         # 计算新颖度（与已有经验的距离）
@@ -352,7 +362,7 @@ class SelfEvolution:
                 exp = self.experience_buffer[idx]
                 noisy_input = exp.input_data + np.random.randn(*exp.input_data.shape).astype(np.float32) * self.mutation_rate
 
-                output = self.model.forward(noisy_input)
+                output = self._forward(noisy_input)
                 decision = output.decision
 
                 # 评估适应度：决策稳定性 + 与高奖励经验的相似度
@@ -390,7 +400,7 @@ class SelfEvolution:
         for exp in experiences[:top_n]:
             # 重复激活 NeuroFlow 来巩固
             for _ in range(3):
-                self.model.forward(exp.input_data, consolidate=True)
+                self._forward(exp.input_data)
 
     def get_fitness(self) -> Dict[str, Any]:
         """获取进化适应度报告"""
@@ -429,7 +439,7 @@ class SelfEvolution:
                           np.random.randn(*e1.input_data.shape).astype(np.float32) * noise_level)
 
             # 评估混合输入
-            output = self.model.forward(mixed_input)
+            output = self._forward(mixed_input)
             decision = output.decision
 
             # 自我奖励：决策越稳定越好
