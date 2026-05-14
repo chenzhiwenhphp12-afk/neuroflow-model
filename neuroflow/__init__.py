@@ -112,6 +112,8 @@ def get_backend():
     return _BACKEND
 
 
+from neuroflow.decoder import TextDecoder, TokenSampler
+
 __all__ = [
     # Version & backend
     "__version__",
