@@ -1,32 +1,65 @@
 """
-NeuroFlow — 类脑模块化神经网络框架
-
-灵感来源于2026年神经科学前沿研究 + DeepSeek V4 核心技术，实现了：
-1. 多模块协作架构（执行网络、默认模式网络、显著性网络）
-2. 神经流形（Neural Manifolds）低维表征学习
-3. 动态门控与跨区域信息整合
-4. 类海马体记忆巩固机制
-5. DeepSeek V4 集成：
-   - Engram Memory (百万级上下文)
-   - MLA 压缩注意力
-   - Sparse MoE 稀疏专家
-   - Flash-Attention 4
-   - Muon 优化器
-   - 自我纠错推理
+NeuroFlow — 多模态类脑神经网络框架
+====================================
+Brain-inspired modular neural network with multimodal capabilities.
+Inspired by 2026 neuroscience research.
 
 Author: Chen Zhiwen <chenzhiwenhphp12@gmail.com>
 License: MIT
 """
 
-from neuroflow.model import NeuroFlowModel
-from neuroflow.modules import (
-    ExecutiveControlNetwork,
-    DefaultModeNetwork,
-    SalienceNetwork,
-    MemoryConsolidationModule,
-)
+__version__ = "2.1.0"
 
-# DeepSeek V3 优化模块
+# ---- C++ Core (preferred - SIMD optimized, 43K params, 0.40ms) ----
+try:
+    from neuroflow._core import (
+        # Tensor
+        Tensor,
+        TensorOps,
+        QuantType,
+        MemoryLayout,
+        # Layers
+        Linear,
+        LayerNorm,
+        # Brain Networks
+        ExecutiveControlNetwork,
+        DefaultModeNetwork,
+        SalienceNetwork,
+        # Memory
+        MemoryConsolidationModule,
+        LatentKVCache,
+        # Model
+        NeuroFlowModel,
+        NeuroFlowLite,
+        ModelConfig,
+        ModelOutput,
+        ModelStats,
+        # Convenience
+        create_tensor,
+        benchmark,
+    )
+    _BACKEND = "C++"
+    _HAS_CPP = True
+
+except ImportError:
+    _BACKEND = "Python"
+    _HAS_CPP = False
+
+    # Fallback: pure Python implementations
+    from neuroflow.model import NeuroFlowModel as _PyNeuroFlowModel
+    from neuroflow.modules import (
+        ExecutiveControlNetwork,
+        DefaultModeNetwork,
+        SalienceNetwork,
+        MemoryConsolidationModule,
+    )
+    from neuroflow.model_lite import NeuroFlowModelLite
+
+    # Alias Python model to match C++ API
+    NeuroFlowModel = _PyNeuroFlowModel
+    NeuroFlowLite = NeuroFlowModelLite
+
+# ---- Python Modules (always available) ----
 from neuroflow.deepseek_optimizations import (
     LatentKVCompression,
     SparseMoE,
@@ -37,7 +70,6 @@ from neuroflow.deepseek_optimizations import (
     OptimizedECN,
 )
 
-# DeepSeek V4 高级优化模块
 from neuroflow.deepseek_v4_optimizations import (
     EngramMemory,
     EngramConfig,
@@ -50,15 +82,24 @@ from neuroflow.deepseek_v4_optimizations import (
     NeuroFlowV4,
 )
 
-__version__ = "0.2.0"
+
+def get_backend():
+    """Return the active backend: 'C++' or 'Python'."""
+    return _BACKEND
+
+
 __all__ = [
-    # 原始模块
+    # Version & backend
+    "__version__",
+    "get_backend",
+    # C++ Core / Python Fallback
     "NeuroFlowModel",
+    "NeuroFlowLite",
     "ExecutiveControlNetwork",
     "DefaultModeNetwork",
     "SalienceNetwork",
     "MemoryConsolidationModule",
-    # DeepSeek V3 优化
+    # DeepSeek V3 Optimizations
     "LatentKVCompression",
     "SparseMoE",
     "RotaryPositionalEmbedding",
@@ -66,7 +107,7 @@ __all__ = [
     "quantize_model",
     "EfficientMemoryModule",
     "OptimizedECN",
-    # DeepSeek V4 优化
+    # DeepSeek V4 Optimizations
     "EngramMemory",
     "EngramConfig",
     "MuonOptimizer",
