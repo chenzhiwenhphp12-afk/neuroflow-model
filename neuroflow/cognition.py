@@ -1,7 +1,7 @@
 """
 NeuroFlow 逻辑推理 + 自主学习进化模块
 =====================================
-实现两个核心能力：
+实现两个核心能力:
 
 1. ReasoningLoop — 链式逻辑推理
    多步迭代思考 → 工作记忆 → 反思修正 → 最终决策
@@ -20,22 +20,22 @@ from typing import List, Tuple, Optional, Dict, Any
 
 
 # ================================================================
-# 第一部分：Neuro-Symbolic 双系统推理 (NeuroSymbolicReasoner)
+# 第一部分:Neuro-Symbolic 双系统推理 (NeuroSymbolicReasoner)
 # ================================================================
 # 
-# 架构：丹尼尔·卡尼曼《思考，快与慢》双系统理论
-#   系统 1 (神经直觉)：SN 显著性 + ECN 价值评估 — 纯前传，<1ms
-#   系统 2 (符号逻辑)：RuleEngine 显式规则链 — 可解释，可审计
-#   工作记忆：h_t 自回归传递（非噪声注入）
+# 架构:丹尼尔·卡尼曼《思考,快与慢》双系统理论
+#   系统 1 (神经直觉):SN 显著性 + ECN 价值评估 — 纯前传,<1ms
+#   系统 2 (符号逻辑):RuleEngine 显式规则链 — 可解释,可审计
+#   工作记忆:h_t 自回归传递（非噪声注入）
 #
 # 使用方式:
 #   engine = QuantTradingRules()          # 加载领域规则
 #   reasoner = NeuroSymbolicReasoner(model, engine)
 #   trace = reasoner.reason(input_data, max_steps=10)
 #
-# 与旧 ReasoningLoop 的区别：
-#   ❌ 旧：噪声衰减注入 → 数值收敛幻觉 → 无解释性
-#   ✅ 新：规则引擎驱动 → 符号逻辑推演 → 可审计决策
+# 与旧 ReasoningLoop 的区别:
+#   ❌ 旧:噪声衰减注入 → 数值收敛幻觉 → 无解释性
+#   ✅ 新:规则引擎驱动 → 符号逻辑推演 → 可审计决策
 
 
 @dataclass
@@ -149,7 +149,7 @@ class DefaultRuleEngine(RuleEngine):
                 explanation=f"Saliency-driven: {saliency:.3f} > {self.saliency_threshold}"
             ))
         
-        # 规则 3: 如果没有候选，选最高 decision
+        # 规则 3: 如果没有候选,选最高 decision
         if not candidates:
             best_idx = int(np.argmax(decision))
             action = np.zeros_like(ctx.value)
@@ -181,7 +181,7 @@ class DefaultRuleEngine(RuleEngine):
 
 class QuantTradingRules(RuleEngine):
     """
-    量化交易规则引擎 — 示例：展示领域规则如何挂载。
+    量化交易规则引擎 — 示例:展示领域规则如何挂载。
     
     规则:
     1. 止损: 亏损 > 阈值 → 强制平仓 (confidence=1.0, terminal)
@@ -190,7 +190,7 @@ class QuantTradingRules(RuleEngine):
     4. 均值回归: 偏离均值 → 反向操作
     5. 默认: 系统 1 的 Value 驱动
     
-    注意: 这是架构示例，实际接入需 vnpy/Backtrader 等回测框架。
+    注意: 这是架构示例,实际接入需 vnpy/Backtrader 等回测框架。
     """
     
     def __init__(self, 
@@ -240,7 +240,7 @@ class QuantTradingRules(RuleEngine):
         return candidates
     
     def select_best(self, ctx: RuleContext, candidates: List[RuleResult]) -> RuleResult:
-        # 止损/止盈已在上层处理，这里仅选最高置信度
+        # 止损/止盈已在上层处理,这里仅选最高置信度
         return max(candidates, key=lambda c: c.confidence)
 
 
@@ -261,7 +261,7 @@ class NeuroSymbolicTrace:
     @property
     def thoughts(self) -> List:
         """兼容旧 ReasoningTrace.thoughts 接口。
-        返回 Thought 样式的对象列表，每条带 .confidence/.decision/.value 属性。
+        返回 Thought 样式的对象列表,每条带 .confidence/.decision/.value 属性。
         """
         class CompatThought:
             def __init__(self, step_data):
@@ -293,6 +293,9 @@ class NeuroSymbolicReasoner:
         self.hidden_dim = hidden_dim
     
     def _forward(self, x):
+        # 支持 TrainableHead
+        if hasattr(self.model, 'predict'):
+            return self.model.predict(x)
         if hasattr(self.model, 'forward_text'):
             return self.model.forward_text(x)
         return self.model.forward(x)
@@ -399,7 +402,7 @@ class NeuroSymbolicReasoner:
 
 
 # ================================================================
-# 第二部分：旧 ReasoningLoop (保留兼容，标记为 deprecated)
+# 第二部分:旧 ReasoningLoop (保留兼容,标记为 deprecated)
 # ================================================================
 
 @dataclass
@@ -426,11 +429,11 @@ class ReasoningLoop:
     """
     链式逻辑推理引擎。
 
-    模拟人脑推理过程：
+    模拟人脑推理过程:
     1. 接收输入 → SN 检测显著性
     2. ECN 做初步决策 → 评估价值
     3. DMN 检索相关记忆
-    4. 反思：决策是否合理？→ 如果不确定，回到步骤2
+    4. 反思:决策是否合理？→ 如果不确定,回到步骤2
     5. 收敛后输出最终决策
 
     使用方式:
@@ -469,7 +472,7 @@ class ReasoningLoop:
             x: 输入 [batch, input_dim]
             max_steps: 最大推理步数
             confidence_threshold: 置信度阈值（达到即停止）
-            temperature: 探索温度（<1 更保守，>1 更激进）
+            temperature: 探索温度（<1 更保守,>1 更激进）
             verbose: 打印推理过程
 
         Returns:
@@ -531,7 +534,7 @@ class ReasoningLoop:
                     print(f"  ✓ Converged at step {step}")
                 break
 
-            # 6. 反思与修正：用当前决策反馈更新输入
+            # 6. 反思与修正:用当前决策反馈更新输入
             # ECN gate 调制 → 关注不确定的区域
             try:
                 ecn_gate = getattr(output, "ecn_gate", None)
@@ -545,7 +548,7 @@ class ReasoningLoop:
             except Exception:
                 noise = np.random.randn(*current_input.shape) * temperature * 0.1
 
-            # 更新：保留 70% 原信号 + 30% 反思修正
+            # 更新:保留 70% 原信号 + 30% 反思修正
             current_input = (current_input * 0.7 + noise * 0.3).astype(np.float32)
             prev_decision = decision
 
@@ -578,7 +581,7 @@ class ReasoningLoop:
 
 
 # ================================================================
-# 第二部分：自主学习进化 (SelfEvolution)
+# 第二部分:自主学习进化 (SelfEvolution)
 # ================================================================
 
 @dataclass
@@ -595,10 +598,10 @@ class SelfEvolution:
     """
     自主学习进化引擎。
 
-    模拟生物神经进化机制：
+    模拟生物神经进化机制:
     1. 经验积累 — 存储每次交互的 (输入, 决策, 奖励)
     2. 自我反思 — 评估哪些经验有价值
-    3. 权重变异 — 小随机扰动，选择有利突变
+    3. 权重变异 — 小随机扰动,选择有利突变
     4. 优胜劣汰 — 保留高奖励的权重变化
     5. 周期巩固 — 类似睡眠中的记忆巩固
 
@@ -641,15 +644,12 @@ class SelfEvolution:
         return self._forward(x)
 
     def learn(self, x: np.ndarray, target_reward: float = 0.5):
-        """
-        单次学习：存储经验 + 在线更新。
-
-        Args:
-            x: 输入
-            target_reward: 目标奖励（由外部环境给出）
-        """
-        # 前向
-        output = self._forward(x)
+        """Single-step learning: store experience + online update."""
+        # Forward
+        if hasattr(self.model, 'predict'):
+            output = self.model.predict(x)
+        else:
+            output = self._forward(x)
         decision = output.decision.copy()
 
         # 计算新颖度（与已有经验的距离）
@@ -676,10 +676,10 @@ class SelfEvolution:
 
     def reflect(self, n_samples: int = 32) -> Dict[str, Any]:
         """
-        自我反思：回放经验，评估质量。
+        自我反思: 回放经验,评估质量。
         
         Returns:
-            反思报告：哪些经验被高估/低估、记忆质量
+            反思报告:哪些经验被高估/低估, 记忆质量
         """
         if len(self.experience_buffer) < n_samples:
             return {"status": "insufficient_data", "n_experiences": len(self.experience_buffer)}
@@ -704,9 +704,9 @@ class SelfEvolution:
 
     def evolve(self, generations: int = 100, population_size: int = 5, verbose: bool = False):
         """
-        进化：多代变异 + 选择。
+        进化:多代变异 + 选择。
 
-        每代：
+        每代:
         1. 从当前权重产生 N 个变体（小随机扰动）
         2. 用经验回放评估每个变体
         3. 保留最优变体
@@ -733,7 +733,7 @@ class SelfEvolution:
                 base_W = None
 
             for p in range(population_size):
-                # 模拟变异：对输入加噪声，看决策是否更好
+                # 模拟变异:对输入加噪声,看决策是否更好
                 if len(self.experience_buffer) < 5:
                     break
 
@@ -744,7 +744,7 @@ class SelfEvolution:
                 output = self._forward(noisy_input)
                 decision = output.decision
 
-                # 评估适应度：决策稳定性 + 与高奖励经验的相似度
+                # 评估适应度:决策稳定性 + 与高奖励经验的相似度
                 stability = 1.0 - float(np.mean(np.abs(decision - exp.decision)))
                 fitness = stability * 0.5 + exp.reward * 0.5
 
@@ -765,13 +765,13 @@ class SelfEvolution:
 
     def consolidate(self):
         """
-        记忆巩固：类似睡眠中的 LTP 过程。
-        对高奖励经验重复激活，强化神经通路。
+        记忆巩固:类似睡眠中的 LTP 过程。
+        对高奖励经验重复激活,强化神经通路。
         """
         if len(self.experience_buffer) < 5:
             return
 
-        # 按奖励排序，取 top 20%
+        # 按奖励排序,取 top 20%
         experiences = list(self.experience_buffer)
         experiences.sort(key=lambda e: e.reward, reverse=True)
         top_n = max(5, len(experiences) // 5)
@@ -795,7 +795,7 @@ class SelfEvolution:
 
     def auto_curriculum(self, steps: int = 10):
         """
-        自动课程学习：从简单到复杂自我生成训练目标。
+        自动课程学习:从简单到复杂自我生成训练目标。
         
         1. 从现有经验中学习模式
         2. 逐渐增加输入复杂度
@@ -821,7 +821,7 @@ class SelfEvolution:
             output = self._forward(mixed_input)
             decision = output.decision
 
-            # 自我奖励：决策越稳定越好
+            # 自我奖励:决策越稳定越好
             stability = 1.0 - float(np.mean(np.abs(decision - e1.decision)))
             reward = stability * 0.7 + e1.reward * 0.3
 
@@ -836,14 +836,14 @@ class SelfEvolution:
 
 
 # ================================================================
-# 第三部分：集成 — 推理+进化的智能体
+# 第三部分:集成 — 推理+进化的智能体
 # ================================================================
 
 class AutonomousAgent:
     """
-    自主智能体：推理 + 进化 + 记忆。
+    自主智能体:推理 + 进化 + 记忆。
     
-    完整的认知循环：
+    完整的认知循环:
     perceive → reason → act → learn → evolve → consolidate
     
     v2: 默认使用 NeuroSymbolicReasoner (系统1神经 + 系统2符号)。
