@@ -1,0 +1,15 @@
+{
+  "env": "CartPole-v1",
+  "episodes": 20,
+  "neuroflow": {
+    "avg": 9.65,
+    "std": 0.7262919523166976,
+    "best": 11.0
+  },
+  "random": {
+    "avg": 23.05,
+    "std": 17.514208517657888
+  },
+  "improvement_pct": -58.13449023861171,
+  "elapsed_s": 0.32512903213500977
+}

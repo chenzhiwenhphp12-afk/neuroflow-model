@@ -17,6 +17,9 @@
 **NeuroFlow** 是一个受2026年神经科学研究启发的**多模态类脑模块化神经网络**。它模拟人类大脑三大核心网络（SN/ECN/DMN），支持文本+图像多模态推理，用纯C++17实现，零外部依赖，在CPU上实现毫秒级推理。
 
 > 🎯 **设计哲学：** 像大脑一样思考，像C++一样执行。每个组件都映射到真实的脑区功能。
+> 
+> ⚠️ **核心定位：** NeuroFlow 不是 LLM 的竞争者，而是 LLM 的驾驶者。它是低功耗决策中枢，不是知识存储器。
+> 详见 **[📐 DESIGN.md](DESIGN.md)** — 感知代理分离原则、Neuro-Symbolic 双系统架构、学习策略、应用场景矩阵。
 
 ---
 
@@ -190,6 +193,20 @@ output = model.forward_image_only(image_data)
 # 3. 多模态推理
 output = model.forward_multimodal(text_features, image_data)
 # → decision, value, saliency, text_image_sim, anomaly, ...
+```
+
+---
+
+## 🚀 部署
+
+完整部署手册（Linux / macOS / Windows / Docker / GPU）：**[📖 DEPLOYMENT.md](DEPLOYMENT.md)**
+
+```bash
+# 一键部署
+bash scripts/deploy.sh
+
+# 或 pip 安装
+pip install git+https://github.com/chenzhiwenhphp12-afk/neuroflow-model.git
 ```
 
 ---
