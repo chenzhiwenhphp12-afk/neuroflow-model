@@ -316,28 +316,91 @@ PYBIND11_MODULE(_core, m) {
         return result;
     }, "Benchmark comparison between original and lite models");
 
-    // ═══ NeuroFlowMultiModal 绑定 ═══
+    // ================================================================
+    // MultiModal Bindings
+    // ================================================================
+    
+    // VisionEncoder
+    py::class_<VisionEncoder>(m, "VisionEncoder")
+        .def(py::init<size_t, size_t, size_t, size_t, size_t>(),
+            py::arg("image_size") = 224, py::arg("patch_size") = 16,
+            py::arg("embed_dim") = 256, py::arg("num_heads") = 8,
+            py::arg("num_layers") = 4)
+        .def("forward", &VisionEncoder::forward);
+    
+    // CrossModalFusion
+    py::class_<CrossModalFusion::Output>(m, "FusionOutput")
+        .def_readonly("fused", &CrossModalFusion::Output::fused)
+        .def_readonly("text_feat", &CrossModalFusion::Output::text_feat)
+        .def_readonly("image_feat", &CrossModalFusion::Output::image_feat)
+        .def_readonly("similarity", &CrossModalFusion::Output::similarity);
+    
+    py::class_<CrossModalFusion>(m, "CrossModalFusion")
+        .def(py::init<size_t, size_t, size_t>(),
+            py::arg("text_dim") = 512, py::arg("vision_dim") = 256,
+            py::arg("fusion_dim") = 256)
+        .def("forward", &CrossModalFusion::forward);
+    
+    // NeuroFlowMultiModal::Config
     py::class_<NeuroFlowMultiModal::Config>(m, "MultiModalConfig")
         .def(py::init<>())
         .def_readwrite("text_dim", &NeuroFlowMultiModal::Config::text_dim)
         .def_readwrite("image_size", &NeuroFlowMultiModal::Config::image_size)
+        .def_readwrite("patch_size", &NeuroFlowMultiModal::Config::patch_size)
+        .def_readwrite("vision_dim", &NeuroFlowMultiModal::Config::vision_dim)
+        .def_readwrite("fusion_dim", &NeuroFlowMultiModal::Config::fusion_dim)
+        .def_readwrite("hidden_dim", &NeuroFlowMultiModal::Config::hidden_dim)
         .def_readwrite("output_dim", &NeuroFlowMultiModal::Config::output_dim)
-        .def_readwrite("use_quantization", &NeuroFlowMultiModal::Config::use_quantization);
-
-    // ═══ 多模态模型工厂 ═══
-    m.def("create_multimodal", [](size_t text_dim, size_t image_size, size_t output_dim, bool quantize,
-                                   size_t hidden_dim, size_t memory_dim, size_t num_layers) -> NeuroFlowModel {
-        // 直接构造 NeuroFlowModel（多模态模型继承但只需 text forward）
-        NeuroFlowModel::Config cfg;
-        cfg.input_dim = text_dim;
-        cfg.hidden_dim = hidden_dim;
+        .def_readwrite("memory_dim", &NeuroFlowMultiModal::Config::memory_dim)
+        .def_readwrite("memory_slots", &NeuroFlowMultiModal::Config::memory_slots)
+        .def_readwrite("num_layers", &NeuroFlowMultiModal::Config::num_layers)
+        .def_readwrite("num_associations", &NeuroFlowMultiModal::Config::num_associations)
+        .def_readwrite("vision_layers", &NeuroFlowMultiModal::Config::vision_layers)
+        .def_readwrite("vision_heads", &NeuroFlowMultiModal::Config::vision_heads)
+        .def_readwrite("use_quantization", &NeuroFlowMultiModal::Config::use_quantization)
+        .def_readwrite("use_mla", &NeuroFlowMultiModal::Config::use_mla)
+        .def_readwrite("mla_latent_dim", &NeuroFlowMultiModal::Config::mla_latent_dim);
+    
+    // NeuroFlowMultiModal::Output
+    py::class_<NeuroFlowMultiModal::Output>(m, "MultiModalOutput")
+        .def_property_readonly("output", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.output); })
+        .def_property_readonly("decision", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.decision); })
+        .def_property_readonly("value", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.value); })
+        .def_property_readonly("saliency", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.saliency); })
+        .def_property_readonly("text_image_sim", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.text_image_sim); })
+        .def_property_readonly("gates", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.gates); })
+        .def_property_readonly("anomaly", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.anomaly); })
+        .def_property_readonly("retrieved_mem", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.retrieved_mem); })
+        .def_property_readonly("vision_feat", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.vision_feat); })
+        .def_property_readonly("text_feat", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.text_feat); })
+        .def_property_readonly("fused_feat", [](NeuroFlowMultiModal::Output& o) { return tensor_to_numpy(o.fused_feat); });
+    
+    // NeuroFlowMultiModal
+    py::class_<NeuroFlowMultiModal>(m, "NeuroFlowMultiModal")
+        .def(py::init<NeuroFlowMultiModal::Config>(), py::arg("config"))
+        .def("forward_multimodal", [](NeuroFlowMultiModal& mm, py::array_t<float> text, py::array_t<float> image, bool consolidate, bool return_manifold) {
+            return mm.forward_multimodal(numpy_to_tensor(text), numpy_to_tensor(image), consolidate, return_manifold);
+        }, py::arg("text"), py::arg("image"), py::arg("consolidate") = false, py::arg("return_manifold") = false)
+        .def("forward_text", [](NeuroFlowMultiModal& mm, py::array_t<float> text) {
+            return mm.forward_text(numpy_to_tensor(text));
+        }, py::arg("text"))
+        .def("forward_image", [](NeuroFlowMultiModal& mm, py::array_t<float> image) {
+            return mm.forward_image_only(numpy_to_tensor(image));
+        }, py::arg("image"))
+        .def("set_training", &NeuroFlowMultiModal::set_training)
+        .def("quantize", &NeuroFlowMultiModal::quantize)
+        .def("get_stats", &NeuroFlowMultiModal::get_stats)
+        .def("save", &NeuroFlowMultiModal::save)
+        .def("load", &NeuroFlowMultiModal::load)
+        .def_readonly("config", &NeuroFlowMultiModal::config);
+    
+    // 便捷：创建默认多模态模型
+    m.def("create_multimodal", [](size_t text_dim, size_t image_size, size_t output_dim, bool quantize) {
+        NeuroFlowMultiModal::Config cfg;
+        cfg.text_dim = text_dim;
+        cfg.image_size = image_size;
         cfg.output_dim = output_dim;
-        cfg.memory_dim = memory_dim;
-        cfg.memory_slots = 128;
-        cfg.num_layers = num_layers;
-        cfg.num_associations = 16;
         cfg.use_quantization = quantize;
-        return NeuroFlowModel(cfg);
-    }, py::arg("text_dim") = 512, py::arg("image_size") = 224, py::arg("output_dim") = 10, py::arg("quantize") = false,
-       py::arg("hidden_dim") = 256, py::arg("memory_dim") = 128, py::arg("num_layers") = 2);
+        return std::make_unique<NeuroFlowMultiModal>(cfg);
+    }, py::arg("text_dim") = 512, py::arg("image_size") = 224, py::arg("output_dim") = 10, py::arg("quantize") = false);
 }
