@@ -53,7 +53,7 @@ OUTPUT_DIM = 1024       # 输出维度 = 全量编码重建
 HEAD_ACTIONS = 1024     # 决策头维度 = 全量编码
 MEM_DIM = 256           # C++ retrieved_mem 维度
 MEM_LOSS_WEIGHT = 0.3   # retrieved_mem 损失权重
-CONTRASTIVE_WEIGHT = 0.8    # 对比损失权重（提升至0.8，加大域间推散力）
+CONTRASTIVE_WEIGHT = 1.2    # 对比损失权重（从0.8提升至1.2，增强域间推散力）
 VOCAB_SIZE = 500        # 词汇表大小（top 500 高频字符，提高正类密度）
 VOCAB_LOSS_WEIGHT = 0.0     # 词汇预测损失权重（设为0禁用词表头，避免共享层不稳定）
 VOCAB_POS_WEIGHT = 1.0      # 正类加权（未使用）
@@ -488,6 +488,8 @@ class NeuroFlowDaemonV3:
         self._init_model()
         self.data_source = HybridDataSource()
 
+        self._last_slot_prune_batch = 0  # 记录上次修剪的批次
+        
         # 状态
         self.state = {
             "started": datetime.now().isoformat(),
@@ -510,13 +512,24 @@ class NeuroFlowDaemonV3:
     def _init_model(self):
         """初始化模型 + W_h2加深 + W_gen词汇预测 + vocab加载"""
         from neuroflow._core import create_multimodal
-        from neuroflow.cognition import NeuroSymbolicReasoner
         from neuroflow.trainable_head import TrainableHead
-
+        
+        # NeuroSymbolicReasoner 兼容包装（新cognition.py使用ReasoningLoop）
+        from neuroflow.cognition import ReasoningLoop
+        class _NSR(ReasoningLoop):
+            def reason(self, x, max_steps=5, verbose=False):
+                trace = super().reason(x, max_steps=max_steps, verbose=verbose)
+                trace.final_confidence = trace.thoughts[-1].confidence if trace.thoughts else 0.5
+                trace.final_action = trace.final_decision
+                trace.steps = trace.thoughts
+                trace.elapsed_ms = trace.convergence_time
+                trace.explanation = ""
+                return trace
+        
         self.model = create_multimodal(
             text_dim=TEXT_DIM, image_size=224, output_dim=OUTPUT_DIM, quantize=True
         )
-        self.reasoner = NeuroSymbolicReasoner(self.model)
+        self.reasoner = _NSR(self.model)
         self.head = TrainableHead(
             self.model, hidden_dim=HIDDEN_DIM, n_actions=HEAD_ACTIONS, lr=0.01,
             input_dim=TEXT_DIM
@@ -852,6 +865,13 @@ class NeuroFlowDaemonV3:
         scores_topk = np.partition(scores_exp, -topk, axis=1)[:, -topk:-topk+1].min(axis=1, keepdims=True)
         scores_exp = scores_exp * (scores_exp >= scores_topk)
         attn = scores_exp / (np.sum(scores_exp, axis=1, keepdims=True) + 1e-8)  # [N, 64]
+        
+        # ── 记忆槽使用跟踪（用于闲置槽自动替换） ──
+        slot_hits = (attn > 0.01).sum(axis=0)  # 每个槽被多少样本激活
+        if not hasattr(self, '_slot_hits'):
+            self._slot_hits = np.zeros(attn.shape[1], dtype=np.int32)
+        self._slot_hits += np.clip(slot_hits.astype(np.int32), 0, 1)  # 槽在批次中被用过就算1次
+        
         mem_read = attn @ self.M_V                       # [N, 256] 读记忆值
         mem_feat = mem_read @ self.W_mem_out             # [N, 512] 投影到隐层
         # 门控融合: 学习每个维度该用多少原始特征 vs 记忆
@@ -1126,6 +1146,28 @@ class NeuroFlowDaemonV3:
             # 记录进化
             self.state['auto_evolutions'] = self.state.get('auto_evolutions', 0) + 1
         
+        # ── 5. 记忆槽检测：每50个batch检查并替换闲置槽 ──
+        batch_count = self.state.get('train_steps', 0) // BATCH_SIZE
+        if (hasattr(self, '_slot_hits') and 
+            self._last_slot_prune_batch > 0 and
+            batch_count - self._last_slot_prune_batch >= 50 and
+            batch_count > 10):
+            usage_rate = self._slot_hits.astype(np.float32) / (batch_count - self._last_slot_prune_batch)
+            idle_slots = np.where(usage_rate < 0.02)[0]  # 使用率<2%的槽
+            if len(idle_slots) > 0:
+                self._slot_hits = np.zeros_like(self._slot_hits)  # 重置计数
+                self._last_slot_prune_batch = batch_count
+                # 重新初始化闲置槽（保留活跃槽的学习内容）
+                for sid in idle_slots:
+                    self.M_K[sid] = np.random.randn(256).astype(np.float32)
+                    self.M_K[sid] /= np.linalg.norm(self.M_K[sid]) + 1e-8
+                    self.M_V[sid] = np.random.randn(256).astype(np.float32) * 0.01
+                evolutions_made.append(f"  🗑️ 替换{len(idle_slots)}个闲置记忆槽({idle_slots.tolist()})")
+        elif batch_count > 10 and self._last_slot_prune_batch == 0:
+            # 首次到达10个batch，初始化计数基准
+            self._last_slot_prune_batch = batch_count
+            self._slot_hits = np.zeros_like(self._slot_hits)
+        
         return evolutions_made
 
     def _save_knowledge(self, text: str):
@@ -1222,8 +1264,8 @@ class NeuroFlowDaemonV3:
                     self._save_state()
                     self.last_status = now
                 
-                # 每5个batch训练一次独立词表头（加速收敛）
-                if batch_count % 5 == 0 and batch_count > 0:
+                # 每2个batch训练一次独立词表头（原为5，加速收敛）
+                if batch_count % 2 == 0 and batch_count > 0:
                     v_result = self._train_vocab_separately()
                     if v_result["vocab_acc"] > 0.01:
                         print(f"  📝 词表头训练: loss={v_result['vocab_loss']:.4f} "
