@@ -5,6 +5,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# OpenMP
+find_package(OpenMP REQUIRED)
+
 # 编译选项
 option(NEUROFLOW_BUILD_TESTS "Build unit tests" ON)
 option(NEUROFLOW_BUILD_PYTHON "Build Python bindings" ON)
@@ -29,8 +32,8 @@ if(NEUROFLOW_USE_NEON AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm|aarch64")
     message(STATUS "ARM NEON SIMD enabled")
 endif()
 
-# 优化选项
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+# 优化选项 — 针对双路 Xeon E5-2666 v3 (Haswell-EP, AVX2+FMA)
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -mtune=native -funroll-loops -ffast-math -ftree-vectorize -fopenmp")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -DDEBUG")
 
 # 核心库
@@ -72,9 +75,9 @@ if(NEUROFLOW_BUILD_PYTHON)
     endif()
     
     if(NEUROFLOW_BUILD_PYTHON)
-        pybind11_add_module(neuroflow_python bindings/python_bindings.cpp)
-        target_link_libraries(neuroflow_python PRIVATE neuroflow_core)
-        target_compile_definitions(neuroflow_python PRIVATE VERSION_INFO=${PROJECT_VERSION})
+        pybind11_add_module(_core bindings/python_bindings.cpp)
+        target_link_libraries(_core PRIVATE neuroflow_core OpenMP::OpenMP_CXX)
+        target_compile_definitions(_core PRIVATE VERSION_INFO=${PROJECT_VERSION})
         message(STATUS "Python bindings enabled")
     endif()
 endif()

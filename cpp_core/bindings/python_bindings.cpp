@@ -14,6 +14,7 @@
 #include "neuroflow/tensor.hpp"
 #include "neuroflow/networks.hpp"
 #include "neuroflow/memory.hpp"
+#include "neuroflow/multimodal_model.hpp"
 
 namespace py = pybind11;
 using namespace neuroflow;
@@ -53,7 +54,7 @@ py::array_t<float> tensor_to_numpy(const Tensor& t) {
     return arr;
 }
 
-PYBIND11_MODULE(neuroflow_python, m) {
+PYBIND11_MODULE(_core, m) {
     m.doc() = "NeuroFlow C++ Core - Lightweight Brain-Inspired Neural Network";
     
     // 版本
@@ -268,6 +269,10 @@ PYBIND11_MODULE(neuroflow_python, m) {
         .def("get_stats", &NeuroFlowModel::get_stats)
         .def("save", &NeuroFlowModel::save)
         .def("load", &NeuroFlowModel::load)
+        .def("forward_text", [](NeuroFlowModel& m, py::array_t<float> x) {
+            Tensor input = numpy_to_tensor(x);
+            return m.forward(input);
+        })
         .def_property_readonly("config", [](NeuroFlowModel& m) { return m.config; });
     
     // NeuroFlowLite
@@ -310,4 +315,29 @@ PYBIND11_MODULE(neuroflow_python, m) {
         
         return result;
     }, "Benchmark comparison between original and lite models");
+
+    // ═══ NeuroFlowMultiModal 绑定 ═══
+    py::class_<NeuroFlowMultiModal::Config>(m, "MultiModalConfig")
+        .def(py::init<>())
+        .def_readwrite("text_dim", &NeuroFlowMultiModal::Config::text_dim)
+        .def_readwrite("image_size", &NeuroFlowMultiModal::Config::image_size)
+        .def_readwrite("output_dim", &NeuroFlowMultiModal::Config::output_dim)
+        .def_readwrite("use_quantization", &NeuroFlowMultiModal::Config::use_quantization);
+
+    // ═══ 多模态模型工厂 ═══
+    m.def("create_multimodal", [](size_t text_dim, size_t image_size, size_t output_dim, bool quantize,
+                                   size_t hidden_dim, size_t memory_dim, size_t num_layers) -> NeuroFlowModel {
+        // 直接构造 NeuroFlowModel（多模态模型继承但只需 text forward）
+        NeuroFlowModel::Config cfg;
+        cfg.input_dim = text_dim;
+        cfg.hidden_dim = hidden_dim;
+        cfg.output_dim = output_dim;
+        cfg.memory_dim = memory_dim;
+        cfg.memory_slots = 128;
+        cfg.num_layers = num_layers;
+        cfg.num_associations = 16;
+        cfg.use_quantization = quantize;
+        return NeuroFlowModel(cfg);
+    }, py::arg("text_dim") = 512, py::arg("image_size") = 224, py::arg("output_dim") = 10, py::arg("quantize") = false,
+       py::arg("hidden_dim") = 256, py::arg("memory_dim") = 128, py::arg("num_layers") = 2);
 }

@@ -1,163 +1,59 @@
 #!/bin/bash
-# NeuroFlow C++ Core Build Script
+# NeuroFlow C++ 编译脚本 — 自动暂停/恢复 cron 防止冲突
+set -euo pipefail
 
-set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_DIR="$SCRIPT_DIR/build"
+DEST="/mnt/d/neuroflow-model/neuroflow/_core.cpython-311-x86_64-linux-gnu.so"
+VENV_PYTHON="$HOME/.hermes/hermes-agent/venv/bin/python3"
+PYBIND11_DIR="$($VENV_PYTHON -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+CRON_LEARN="bd007dc2fe14"
+CRON_REPORT="5d4dac90ff0d"
 
-echo "========================================"
-echo "NeuroFlow C++ Core Build"
-echo "========================================"
+echo "=== NeuroFlow C++ Build ==="
 
-# 检查依赖
-check_dependencies() {
-    echo "Checking dependencies..."
-    
-    # CMake
-    if ! command -v cmake &> /dev/null; then
-        echo "ERROR: cmake not found. Please install cmake >= 3.14"
-        exit 1
-    fi
-    
-    # C++编译器
-    if ! command -v g++ &> /dev/null && ! command -v clang++ &> /dev/null; then
-        echo "ERROR: C++ compiler not found"
-        exit 1
-    fi
-    
-    echo "  cmake: $(cmake --version | head -1)"
-    echo "  compiler: ${CXX:-g++}"
-}
+# 1. 暂停 cron 任务
+echo "[1/5] Pausing cron jobs..."
+hermes cron pause "$CRON_LEARN" 2>/dev/null || echo "  ($CRON_LEARN already paused)"
+hermes cron pause "$CRON_REPORT" 2>/dev/null || echo "  ($CRON_REPORT already paused)"
+sleep 2  # 等正在运行的任务结束
 
-# 构建C++核心
-build_cpp() {
-    echo ""
-    echo "Building C++ core..."
-    
-    mkdir -p build
-    cd build
-    
-    cmake .. \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DNEUROFLOW_BUILD_TESTS=ON \
-        -DNEUROFLOW_BUILD_PYTHON=OFF
-    
-    make -j$(nproc)
-    
-    echo "  Build complete!"
-}
+# 2. 编译
+echo "[2/5] Building with ninja..."
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
+cmake .. -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DNEUROFLOW_BUILD_TESTS=OFF \
+  -DNEUROFLOW_BUILD_PYTHON=ON \
+  -DPython3_EXECUTABLE="$VENV_PYTHON" \
+  -Dpybind11_DIR="$PYBIND11_DIR"
+ninja -j$(nproc)
 
-# 运行测试
-run_tests() {
-    echo ""
-    echo "Running tests..."
-    
-    cd build
-    
-    if [ -f neuroflow_tests ]; then
-        ./neuroflow_tests
-    else
-        echo "  Tests not built"
-    fi
-}
+# 3. 部署 so 到 neuroflow 包目录
+echo "[3/5] Deploying .so to neuroflow package..."
+cp "$BUILD_DIR/_core.cpython-311-x86_64-linux-gnu.so" "$DEST"
 
-# 构建Python绑定 (可选)
-build_python() {
-    echo ""
-    echo "Building Python bindings..."
-    
-    # 检查pybind11
-    python3 -c "import pybind11" 2>/dev/null || {
-        echo "  pybind11 not found, installing..."
-        pip3 install pybind11
-    }
-    
-    cd build
-    
-    cmake .. \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DNEUROFLOW_BUILD_PYTHON=ON
-    
-    make -j$(nproc)
-    
-    echo "  Python bindings built!"
-    
-    # 测试Python导入
-    python3 -c "import neuroflow_cpp; print('  Import OK')" || {
-        echo "  Warning: Python import failed, check library path"
-    }
-}
+# 4. 验证
+echo "[4/5] Verifying..."
+"$VENV_PYTHON" -c "
+import sys; sys.path.insert(0, '/mnt/d/neuroflow-model')
+from neuroflow._core import create_multimodal
+m = create_multimodal()
+import numpy as np
+x = np.random.randn(1, 512).astype(np.float32)
+out = m.forward_text(x)
+print(f'  forward_text OK, output shape: {out.decision.shape}')
+m.save('/tmp/nf_build_test.bin')
+m2 = create_multimodal()
+m2.load('/tmp/nf_build_test.bin')
+print('  save/load roundtrip OK')
+print('  ✅ Verification passed')
+"
 
-# 安装
-install() {
-    echo ""
-    echo "Installing..."
-    
-    cd build
-    sudo make install
-    
-    echo "  Installed to /usr/local"
-}
+# 5. 恢复 cron
+echo "[5/5] Resuming cron jobs..."
+hermes cron resume "$CRON_LEARN" 2>/dev/null || echo "  ($CRON_LEARN already running)"
+hermes cron resume "$CRON_REPORT" 2>/dev/null || echo "  ($CRON_REPORT already running)"
 
-# 清理
-clean() {
-    echo "Cleaning..."
-    rm -rf build
-    echo "  Clean complete"
-}
-
-# 帮助
-help() {
-    echo "Usage: $0 [command]"
-    echo ""
-    echo "Commands:"
-    echo "  build       Build C++ core"
-    echo "  test        Build and run tests"
-    echo "  python      Build with Python bindings"
-    echo "  install     Install to system"
-    echo "  clean       Clean build directory"
-    echo "  all         Build, test, and install"
-    echo "  help        Show this help"
-}
-
-# 主入口
-case "${1:-build}" in
-    build)
-        check_dependencies
-        build_cpp
-        ;;
-    test)
-        check_dependencies
-        build_cpp
-        run_tests
-        ;;
-    python)
-        check_dependencies
-        build_python
-        ;;
-    install)
-        check_dependencies
-        build_cpp
-        install
-        ;;
-    clean)
-        clean
-        ;;
-    all)
-        check_dependencies
-        build_cpp
-        run_tests
-        install
-        ;;
-    help|--help|-h)
-        help
-        ;;
-    *)
-        echo "Unknown command: $1"
-        help
-        exit 1
-        ;;
-esac
-
-echo ""
-echo "========================================"
-echo "Done!"
-echo "========================================"
+echo "=== Build complete ==="

@@ -14,7 +14,7 @@ venv/
 .venv/
 env/
 
-# Checkpoints & weights
+# Checkpoints & weights (NPZ checkpoints are tracked separately)
 checkpoints/
 *.pt
 *.pth
@@ -33,6 +33,25 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
-# Logs
+# Logs & runtime state
 *.log
 training_history.json
+daemon_state*.json
+daemon_state*.json.bak
+status_report.txt
+cartpole_rl_state.json
+cartpole_linear_state.json
+gh_rate.json
+hn_seen.json
+
+# Knowledge base (too large for GitHub)
+knowledge_base/
+
+# Training data / caches (too large for GitHub)
+data/
+data/*.gz
+data/*.jsonl
+data/*.txt
+
+# Generated vocab caches
+learn_batch_cache/

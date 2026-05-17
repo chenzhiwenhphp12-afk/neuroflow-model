@@ -70,6 +70,9 @@ class RuleEngine:
     
     def __init__(self, name: str = "RuleEngine"):
         self.name = name
+    
+    def reset(self):
+        """每次 reason() 调用前重置内部状态。子类应覆写清理内部缓存。"""
         self.step_count = 0
     
     def init_context(self, x: np.ndarray, hidden_dim: int = 256) -> RuleContext:
@@ -118,6 +121,11 @@ class DefaultRuleEngine(RuleEngine):
         self.saliency_threshold = saliency_threshold
         self.stability_threshold = stability_threshold
         self._value_history = []
+    
+    def reset(self):
+        """每次推理前重置历史状态"""
+        super().reset()
+        self._value_history.clear()
     
     def expand(self, ctx: RuleContext) -> List[RuleResult]:
         decision = ctx.decision.flatten()  # (10,) — 用于动作选择
@@ -321,6 +329,9 @@ class NeuroSymbolicReasoner:
         """
         trace = NeuroSymbolicTrace()
         t0 = time.perf_counter()
+        
+        # 重置规则引擎内部状态（清除跨推理历史累积）
+        self.engine.reset()
         
         # 初始化推理上下文
         ctx = self.engine.init_context(x, self.hidden_dim)

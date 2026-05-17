@@ -1,6 +1,9 @@
 #ifndef NEUROFLOW_MULTIMODAL_MODEL_HPP
 #define NEUROFLOW_MULTIMODAL_MODEL_HPP
 
+#include <fstream>
+#include <string>
+
 /**
  * NeuroFlowMultiModal - 多模态类脑模块化神经网络
  * 
@@ -474,11 +477,195 @@ public:
     
     // ========== 序列化 ==========
     void save(const std::string& path) {
-        // TODO: 实现完整的序列化
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs) throw std::runtime_error("Cannot open file for save: " + path);
+        
+        // Magic header
+        ofs.write("NFv1", 4);
+        
+        // Helper: serialize a named tensor
+        auto save_tensor = [&](const std::string& name, const Tensor& t) {
+            uint32_t name_len = name.size();
+            ofs.write(reinterpret_cast<const char*>(&name_len), 4);
+            ofs.write(name.data(), name_len);
+            
+            uint32_t ndim = t.shape.size();
+            ofs.write(reinterpret_cast<const char*>(&ndim), 4);
+            for (auto d : t.shape) {
+                uint32_t dim = d;
+                ofs.write(reinterpret_cast<const char*>(&dim), 4);
+            }
+            
+            uint32_t dsize = t.data_size;
+            ofs.write(reinterpret_cast<const char*>(&dsize), 4);
+            ofs.write(reinterpret_cast<const char*>(t.data.get()), dsize);
+        };
+        
+        // Helper: save Linear layer (accepts shared_ptr or raw ref)
+        auto save_linear = [&](const std::string& prefix, const std::shared_ptr<Linear>& layer) {
+            save_tensor(prefix + ".weight", layer->weight);
+            if (layer->bias.data) save_tensor(prefix + ".bias", layer->bias);
+            if (layer->weight_scale.data) save_tensor(prefix + ".weight_scale", layer->weight_scale);
+        };
+        auto save_linear_raw = [&](const std::string& prefix, const Linear& layer) {
+            save_tensor(prefix + ".weight", layer.weight);
+            if (layer.bias.data) save_tensor(prefix + ".bias", layer.bias);
+            if (layer.weight_scale.data) save_tensor(prefix + ".weight_scale", layer.weight_scale);
+        };
+        
+        // Helper: save LayerNorm
+        auto save_ln = [&](const std::string& prefix, const LayerNorm& ln) {
+            save_tensor(prefix + ".weight", ln.weight);
+            save_tensor(prefix + ".bias", ln.bias);
+        };
+        
+        // === 投影层 ===
+        save_linear_raw("text_proj", *text_proj);
+        save_ln("text_norm", *text_norm);
+        save_linear_raw("output_layer", *output_layer);
+        save_ln("output_norm", *output_norm);
+        
+        // === 类脑网络 ===
+        save_linear("ecn.dlpfc0", ecn->dlpfc_linear[0]);
+        save_linear("ecn.dlpfc1", ecn->dlpfc_linear[1]);
+        save_linear("ecn.ofc1", ecn->ofc1);
+        save_linear("ecn.ofc2", ecn->ofc2);
+        save_linear("ecn.vmpfc1", ecn->vmpfc1);
+        save_linear("ecn.vmpfc2", ecn->vmpfc2);
+        
+        save_linear("dmn.mem_encoder1", dmn->mem_encoder1);
+        save_linear("dmn.mem_encoder2", dmn->mem_encoder2);
+        save_linear("dmn.future_proj1", dmn->future_proj1);
+        int head_idx = 0;
+        for (auto& [h1, h2] : dmn->association_heads) {
+            save_linear("dmn.head" + std::to_string(head_idx) + ".1", h1);
+            save_linear("dmn.head" + std::to_string(head_idx) + ".2", h2);
+            head_idx++;
+        }
+        
+        save_linear("sn.saliency1", sn->saliency1);
+        save_linear("sn.saliency2", sn->saliency2);
+        save_linear("sn.saliency3", sn->saliency3);
+        save_linear("sn.gate1", sn->gate1);
+        save_linear("sn.gate2", sn->gate2);
+        save_linear("sn.anomaly1", sn->anomaly1);
+        save_linear("sn.anomaly2", sn->anomaly2);
+        
+        save_linear("memory.encode", memory->encode_proj);
+        save_linear("memory.retrieve", memory->retrieve_proj);
+        save_linear("memory.query_proj", memory->query_proj);
+        save_tensor("memory.bank", memory->memory_bank);
+        
+        // End marker
+        uint32_t zero = 0;
+        ofs.write(reinterpret_cast<const char*>(&zero), 4);
+        ofs.close();
     }
     
     void load(const std::string& path) {
-        // TODO: 实现完整的反序列化
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) throw std::runtime_error("Cannot open file for load: " + path);
+        
+        // Magic header
+        char magic[5] = {0};
+        ifs.read(magic, 4);
+        if (std::string(magic) != "NFv1") throw std::runtime_error("Invalid model file");
+        
+        // Helper: load a tensor and set its data
+        auto load_tensor_data = [&](Tensor& t) {
+            uint32_t ndim;
+            ifs.read(reinterpret_cast<char*>(&ndim), 4);
+            std::vector<size_t> shape(ndim);
+            for (uint32_t i = 0; i < ndim; i++) {
+                uint32_t d;
+                ifs.read(reinterpret_cast<char*>(&d), 4);
+                shape[i] = d;
+            }
+            uint32_t dsize;
+            ifs.read(reinterpret_cast<char*>(&dsize), 4);
+            
+            // Only load if shapes match
+            if (shape == t.shape && dsize == t.data_size) {
+                ifs.read(reinterpret_cast<char*>(t.data.get()), dsize);
+            } else if (shape != t.shape) {
+                // Skip mismatched data
+                ifs.seekg(dsize, std::ios::cur);
+            }
+        };
+        
+        // Read tensors
+        while (ifs.good()) {
+            uint32_t name_len;
+            ifs.read(reinterpret_cast<char*>(&name_len), 4);
+            if (name_len == 0 || !ifs) break;
+            
+            std::string name(name_len, '\0');
+            ifs.read(&name[0], name_len);
+            
+            // Match name to tensor
+            if (name == "text_proj.weight") load_tensor_data(text_proj->weight);
+            else if (name == "text_proj.bias") load_tensor_data(text_proj->bias);
+            else if (name == "text_norm.weight") load_tensor_data(text_norm->weight);
+            else if (name == "text_norm.bias") load_tensor_data(text_norm->bias);
+            else if (name == "output_layer.weight") load_tensor_data(output_layer->weight);
+            else if (name == "output_layer.bias") load_tensor_data(output_layer->bias);
+            else if (name == "output_norm.weight") load_tensor_data(output_norm->weight);
+            else if (name == "output_norm.bias") load_tensor_data(output_norm->bias);
+            else if (name == "ecn.dlpfc0.weight") load_tensor_data(ecn->dlpfc_linear[0]->weight);
+            else if (name == "ecn.dlpfc0.bias") load_tensor_data(ecn->dlpfc_linear[0]->bias);
+            else if (name == "ecn.dlpfc1.weight") load_tensor_data(ecn->dlpfc_linear[1]->weight);
+            else if (name == "ecn.dlpfc1.bias") load_tensor_data(ecn->dlpfc_linear[1]->bias);
+            else if (name == "ecn.ofc1.weight") load_tensor_data(ecn->ofc1->weight);
+            else if (name == "ecn.ofc1.bias") load_tensor_data(ecn->ofc1->bias);
+            else if (name == "ecn.ofc2.weight") load_tensor_data(ecn->ofc2->weight);
+            else if (name == "ecn.ofc2.bias") load_tensor_data(ecn->ofc2->bias);
+            else if (name == "ecn.vmpfc1.weight") load_tensor_data(ecn->vmpfc1->weight);
+            else if (name == "ecn.vmpfc1.bias") load_tensor_data(ecn->vmpfc1->bias);
+            else if (name == "ecn.vmpfc2.weight") load_tensor_data(ecn->vmpfc2->weight);
+            else if (name == "ecn.vmpfc2.bias") load_tensor_data(ecn->vmpfc2->bias);
+            else if (name == "dmn.mem_encoder1.weight") load_tensor_data(dmn->mem_encoder1->weight);
+            else if (name == "dmn.mem_encoder1.bias") load_tensor_data(dmn->mem_encoder1->bias);
+            else if (name == "dmn.mem_encoder2.weight") load_tensor_data(dmn->mem_encoder2->weight);
+            else if (name == "dmn.mem_encoder2.bias") load_tensor_data(dmn->mem_encoder2->bias);
+            else if (name == "dmn.future_proj1.weight") load_tensor_data(dmn->future_proj1->weight);
+            else if (name == "dmn.future_proj1.bias") load_tensor_data(dmn->future_proj1->bias);
+            else if (name.find("dmn.head") == 0) {
+                int idx = std::stoi(name.substr(9, name.find('.', 9) - 9));
+                bool is_h1 = (name[name.size()-1] == '1');
+                auto& [h1, h2] = dmn->association_heads[idx];
+                if (is_h1) load_tensor_data(h1->weight);
+                else load_tensor_data(h2->weight);
+            }
+            else if (name == "sn.saliency1.weight") load_tensor_data(sn->saliency1->weight);
+            else if (name == "sn.saliency1.bias") load_tensor_data(sn->saliency1->bias);
+            else if (name == "sn.saliency2.weight") load_tensor_data(sn->saliency2->weight);
+            else if (name == "sn.saliency2.bias") load_tensor_data(sn->saliency2->bias);
+            else if (name == "sn.saliency3.weight") load_tensor_data(sn->saliency3->weight);
+            else if (name == "sn.saliency3.bias") load_tensor_data(sn->saliency3->bias);
+            else if (name == "sn.gate1.weight") load_tensor_data(sn->gate1->weight);
+            else if (name == "sn.gate1.bias") load_tensor_data(sn->gate1->bias);
+            else if (name == "sn.gate2.weight") load_tensor_data(sn->gate2->weight);
+            else if (name == "sn.gate2.bias") load_tensor_data(sn->gate2->bias);
+            else if (name == "sn.anomaly1.weight") load_tensor_data(sn->anomaly1->weight);
+            else if (name == "sn.anomaly1.bias") load_tensor_data(sn->anomaly1->bias);
+            else if (name == "sn.anomaly2.weight") load_tensor_data(sn->anomaly2->weight);
+            else if (name == "sn.anomaly2.bias") load_tensor_data(sn->anomaly2->bias);
+            else if (name == "memory.encode.weight") load_tensor_data(memory->encode_proj->weight);
+            else if (name == "memory.encode.bias") load_tensor_data(memory->encode_proj->bias);
+            else if (name == "memory.retrieve.weight") load_tensor_data(memory->retrieve_proj->weight);
+            else if (name == "memory.retrieve.bias") load_tensor_data(memory->retrieve_proj->bias);
+            else if (name == "memory.query_proj.weight") load_tensor_data(memory->query_proj->weight);
+            else if (name == "memory.query_proj.bias") load_tensor_data(memory->query_proj->bias);
+            else if (name == "memory.bank") load_tensor_data(memory->memory_bank);
+            else {
+                // Unknown tensor: skip
+                uint32_t ndim; ifs.read(reinterpret_cast<char*>(&ndim), 4);
+                for (uint32_t i = 0; i < ndim; i++) { uint32_t d; ifs.read(reinterpret_cast<char*>(&d), 4); }
+                uint32_t dsize; ifs.read(reinterpret_cast<char*>(&dsize), 4);
+                ifs.seekg(dsize, std::ios::cur);
+            }
+        }
+        ifs.close();
     }
 };
 

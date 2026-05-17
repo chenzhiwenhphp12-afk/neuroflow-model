@@ -1,0 +1,15 @@
+{
+  "env": "MountainCar-v0",
+  "episodes": 30,
+  "neuroflow": {
+    "avg": -200.0,
+    "std": 0.0,
+    "best": -200.0
+  },
+  "random": {
+    "avg": -200.0,
+    "std": 0.0
+  },
+  "improvement_pct": 0.0,
+  "elapsed_s": 5.3124473094940186
+}

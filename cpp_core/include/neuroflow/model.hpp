@@ -394,42 +394,223 @@ public:
         return s;
     }
     
-    // 序列化/反序列化
+    // ========== 序列化 (NFv1 格式) ==========
     void save(const std::string& path) {
-        std::ofstream f(path, std::ios::binary);
+        std::ofstream ofs(path, std::ios::binary);
+        if (!ofs) throw std::runtime_error("Cannot open file for save: " + path);
         
-        // 写配置
-        f.write(reinterpret_cast<char*>(&config), sizeof(Config));
+        // Magic header
+        ofs.write("NFv1", 4);
         
-        // 写各层权重 (简化版本)
-        auto write_tensor = [&](const Tensor& t) {
-            f.write(reinterpret_cast<const char*>(t.shape.data()), t.shape.size() * sizeof(size_t));
-            size_t dtype_v = static_cast<size_t>(t.dtype);
-            f.write(reinterpret_cast<const char*>(&dtype_v), sizeof(size_t));
-            f.write(reinterpret_cast<const char*>(t.data.get()), t.data_size);
+        // Helper: serialize a named tensor
+        auto save_tensor = [&](const std::string& name, const Tensor& t) {
+            uint32_t name_len = name.size();
+            ofs.write(reinterpret_cast<const char*>(&name_len), 4);
+            ofs.write(name.data(), name_len);
+            
+            uint32_t ndim = t.shape.size();
+            ofs.write(reinterpret_cast<const char*>(&ndim), 4);
+            for (auto d : t.shape) {
+                uint32_t dim = d;
+                ofs.write(reinterpret_cast<const char*>(&dim), 4);
+            }
+            
+            uint32_t dsize = t.data_size;
+            ofs.write(reinterpret_cast<const char*>(&dsize), 4);
+            ofs.write(reinterpret_cast<const char*>(t.data.get()), dsize);
         };
         
-        write_tensor(input_proj_linear->weight);
-        write_tensor(input_proj_linear->bias);
-        // ... 更多层
+        // Helper: save Linear layer (shared_ptr)
+        auto save_linear = [&](const std::string& prefix, const std::shared_ptr<Linear>& layer) {
+            save_tensor(prefix + ".weight", layer->weight);
+            if (layer->bias.data) save_tensor(prefix + ".bias", layer->bias);
+        };
         
-        f.close();
+        // === 输入投影 ===
+        save_linear("input_proj", input_proj_linear);
+        save_tensor("input_proj_norm.weight", input_proj_norm->weight);
+        save_tensor("input_proj_norm.bias", input_proj_norm->bias);
+        
+        // === ECN ===
+        for (size_t i = 0; i < ecn->dlpfc_linear.size(); ++i)
+            save_linear("ecn.dlpfc" + std::to_string(i), ecn->dlpfc_linear[i]);
+        save_linear("ecn.ofc1", ecn->ofc1);
+        save_linear("ecn.ofc2", ecn->ofc2);
+        save_linear("ecn.vmpfc1", ecn->vmpfc1);
+        save_linear("ecn.vmpfc2", ecn->vmpfc2);
+        
+        // === DMN ===
+        save_linear("dmn.mem_encoder1", dmn->mem_encoder1);
+        save_linear("dmn.mem_encoder2", dmn->mem_encoder2);
+        save_linear("dmn.future_proj1", dmn->future_proj1);
+        int head_idx = 0;
+        for (auto& [h1, h2] : dmn->association_heads) {
+            save_linear("dmn.head" + std::to_string(head_idx) + ".1", h1);
+            save_linear("dmn.head" + std::to_string(head_idx) + ".2", h2);
+            head_idx++;
+        }
+        
+        // === SN ===
+        save_linear("sn.saliency1", sn->saliency1);
+        save_linear("sn.saliency2", sn->saliency2);
+        save_linear("sn.saliency3", sn->saliency3);
+        save_linear("sn.gate1", sn->gate1);
+        save_linear("sn.gate2", sn->gate2);
+        save_linear("sn.anomaly1", sn->anomaly1);
+        save_linear("sn.anomaly2", sn->anomaly2);
+        
+        // === 记忆 ===
+        save_linear("memory.encode", memory->encode_proj);
+        save_linear("memory.retrieve", memory->retrieve_proj);
+        save_linear("memory.query_proj", memory->query_proj);
+        save_tensor("memory.bank", memory->memory_bank);
+        
+        // === 流形投影 ===
+        save_linear("manifold.proj1", manifold_proj1);
+        save_tensor("manifold.norm.weight", manifold_norm->weight);
+        save_tensor("manifold.norm.bias", manifold_norm->bias);
+        save_linear("manifold.proj2", manifold_proj2);
+        
+        // === 输出融合 ===
+        save_linear("output_fusion", output_fusion_linear);
+        save_tensor("output_fusion.norm.weight", output_fusion_norm->weight);
+        save_tensor("output_fusion.norm.bias", output_fusion_norm->bias);
+        
+        // End marker
+        uint32_t zero = 0;
+        ofs.write(reinterpret_cast<const char*>(&zero), 4);
+        ofs.close();
     }
     
     void load(const std::string& path) {
-        std::ifstream f(path, std::ios::binary);
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) throw std::runtime_error("Cannot open file for load: " + path);
         
-        // 读配置
-        Config loaded_cfg;
-        f.read(reinterpret_cast<char*>(&loaded_cfg), sizeof(Config));
+        // Magic header
+        char magic[5] = {0};
+        ifs.read(magic, 4);
+        if (std::string(magic) != "NFv1") throw std::runtime_error("Invalid model file");
         
-        // 读权重
-        auto read_tensor = [&](Tensor& t) {
-            size_t shape_size;
-            // 简化实现...
+        // Helper: set tensor data from stream
+        auto load_tensor_data = [&](Tensor& t) {
+            uint32_t ndim, dsize;
+            ifs.read(reinterpret_cast<char*>(&ndim), 4);
+            std::vector<size_t> shape(ndim);
+            for (uint32_t i = 0; i < ndim; ++i) {
+                uint32_t dim;
+                ifs.read(reinterpret_cast<char*>(&dim), 4);
+                shape[i] = dim;
+            }
+            ifs.read(reinterpret_cast<char*>(&dsize), 4);
+            if (t.data_size != dsize) {
+                // Reallocate — data is shared_ptr<uint8_t>
+                t.data.reset(reinterpret_cast<uint8_t*>(new float[dsize / sizeof(float)]));
+                t.shape = shape;
+                t.data_size = dsize;
+            }
+            ifs.read(reinterpret_cast<char*>(t.data.get()), dsize);
         };
         
-        f.close();
+        // Helper: load named Linear layer
+        auto load_linear = [&](const std::shared_ptr<Linear>& layer, const std::string& suffix) {
+            if (suffix == ".weight") load_tensor_data(layer->weight);
+            else if (suffix == ".bias") { load_tensor_data(layer->bias); }
+        };
+        
+        while (ifs.good()) {
+            uint32_t name_len;
+            ifs.read(reinterpret_cast<char*>(&name_len), 4);
+            if (name_len == 0) break;  // end marker or EOF
+            
+            std::string name(name_len, '\0');
+            ifs.read(&name[0], name_len);
+            
+            // === 输入投影 ===
+            if (name == "input_proj.weight") load_tensor_data(input_proj_linear->weight);
+            else if (name == "input_proj.bias") load_tensor_data(input_proj_linear->bias);
+            else if (name == "input_proj_norm.weight") load_tensor_data(input_proj_norm->weight);
+            else if (name == "input_proj_norm.bias") load_tensor_data(input_proj_norm->bias);
+            
+            // === ECN ===
+            else if (name.rfind("ecn.dlpfc", 0) == 0) {
+                std::string suffix = name.substr(name.find('.', 4));  // e.g. ".weight"
+                int idx = std::stoi(name.substr(9, name.find('.', 9) - 9));
+                load_linear(ecn->dlpfc_linear[idx], suffix);
+            }
+            else if (name == "ecn.ofc1.weight") load_tensor_data(ecn->ofc1->weight);
+            else if (name == "ecn.ofc1.bias") load_tensor_data(ecn->ofc1->bias);
+            else if (name == "ecn.ofc2.weight") load_tensor_data(ecn->ofc2->weight);
+            else if (name == "ecn.ofc2.bias") load_tensor_data(ecn->ofc2->bias);
+            else if (name == "ecn.vmpfc1.weight") load_tensor_data(ecn->vmpfc1->weight);
+            else if (name == "ecn.vmpfc1.bias") load_tensor_data(ecn->vmpfc1->bias);
+            else if (name == "ecn.vmpfc2.weight") load_tensor_data(ecn->vmpfc2->weight);
+            else if (name == "ecn.vmpfc2.bias") load_tensor_data(ecn->vmpfc2->bias);
+            
+            // === DMN ===
+            else if (name == "dmn.mem_encoder1.weight") load_tensor_data(dmn->mem_encoder1->weight);
+            else if (name == "dmn.mem_encoder1.bias") load_tensor_data(dmn->mem_encoder1->bias);
+            else if (name == "dmn.mem_encoder2.weight") load_tensor_data(dmn->mem_encoder2->weight);
+            else if (name == "dmn.mem_encoder2.bias") load_tensor_data(dmn->mem_encoder2->bias);
+            else if (name == "dmn.future_proj1.weight") load_tensor_data(dmn->future_proj1->weight);
+            else if (name == "dmn.future_proj1.bias") load_tensor_data(dmn->future_proj1->bias);
+            else if (name.rfind("dmn.head", 0) == 0) {
+                // dmn.head<N>.<1|2>.<weight|bias>
+                int h = std::stoi(name.substr(8, name.find('.', 8) - 8));
+                int which = name[10 + (h >= 10 ? 1 : 0)] - '0';
+                std::string suffix = name.substr(name.rfind('.'));
+                auto& layer = (which == 1) ? dmn->association_heads[h].first : dmn->association_heads[h].second;
+                load_linear(layer, suffix);
+            }
+            
+            // === SN ===
+            else if (name == "sn.saliency1.weight") load_tensor_data(sn->saliency1->weight);
+            else if (name == "sn.saliency1.bias") load_tensor_data(sn->saliency1->bias);
+            else if (name == "sn.saliency2.weight") load_tensor_data(sn->saliency2->weight);
+            else if (name == "sn.saliency2.bias") load_tensor_data(sn->saliency2->bias);
+            else if (name == "sn.saliency3.weight") load_tensor_data(sn->saliency3->weight);
+            else if (name == "sn.saliency3.bias") load_tensor_data(sn->saliency3->bias);
+            else if (name == "sn.gate1.weight") load_tensor_data(sn->gate1->weight);
+            else if (name == "sn.gate1.bias") load_tensor_data(sn->gate1->bias);
+            else if (name == "sn.gate2.weight") load_tensor_data(sn->gate2->weight);
+            else if (name == "sn.gate2.bias") load_tensor_data(sn->gate2->bias);
+            else if (name == "sn.anomaly1.weight") load_tensor_data(sn->anomaly1->weight);
+            else if (name == "sn.anomaly1.bias") load_tensor_data(sn->anomaly1->bias);
+            else if (name == "sn.anomaly2.weight") load_tensor_data(sn->anomaly2->weight);
+            else if (name == "sn.anomaly2.bias") load_tensor_data(sn->anomaly2->bias);
+            
+            // === 记忆 ===
+            else if (name == "memory.encode.weight") load_tensor_data(memory->encode_proj->weight);
+            else if (name == "memory.encode.bias") load_tensor_data(memory->encode_proj->bias);
+            else if (name == "memory.retrieve.weight") load_tensor_data(memory->retrieve_proj->weight);
+            else if (name == "memory.retrieve.bias") load_tensor_data(memory->retrieve_proj->bias);
+            else if (name == "memory.query_proj.weight") load_tensor_data(memory->query_proj->weight);
+            else if (name == "memory.query_proj.bias") load_tensor_data(memory->query_proj->bias);
+            else if (name == "memory.bank") load_tensor_data(memory->memory_bank);
+            
+            // === 流形投影 ===
+            else if (name == "manifold.proj1.weight") load_tensor_data(manifold_proj1->weight);
+            else if (name == "manifold.proj1.bias") load_tensor_data(manifold_proj1->bias);
+            else if (name == "manifold.norm.weight") load_tensor_data(manifold_norm->weight);
+            else if (name == "manifold.norm.bias") load_tensor_data(manifold_norm->bias);
+            else if (name == "manifold.proj2.weight") load_tensor_data(manifold_proj2->weight);
+            else if (name == "manifold.proj2.bias") load_tensor_data(manifold_proj2->bias);
+            
+            // === 输出融合 ===
+            else if (name == "output_fusion.weight") load_tensor_data(output_fusion_linear->weight);
+            else if (name == "output_fusion.bias") load_tensor_data(output_fusion_linear->bias);
+            else if (name == "output_fusion.norm.weight") load_tensor_data(output_fusion_norm->weight);
+            else if (name == "output_fusion.norm.bias") load_tensor_data(output_fusion_norm->bias);
+            
+            // Unknown layer — skip
+            else {
+                uint32_t ndim, dsize;
+                ifs.read(reinterpret_cast<char*>(&ndim), 4);
+                ifs.seekg(ndim * 4, std::ios::cur);
+                ifs.read(reinterpret_cast<char*>(&dsize), 4);
+                ifs.seekg(dsize, std::ios::cur);
+            }
+        }
+        ifs.close();
     }
 };
 

@@ -6,7 +6,7 @@ NeuroFlow Gym 基准测试
 
 环境: CartPole-v1, LunarLander-v3 (可选)
 """
-import sys, os, time, json, numpy as np
+import sys, os, time, json, random, numpy as np
 from dataclasses import dataclass, field
 from typing import List
 
@@ -20,16 +20,23 @@ from neuroflow.cognition import NeuroSymbolicReasoner, RuleEngine, RuleContext, 
 # ============================================================
 class GymRuleEngine(RuleEngine):
     """
-    通用 Gym 规则引擎。
+    通用 Gym 规则引擎 — 修正版。
+    
     规则:
-    1. 系统 1 Value > 阈值 → 选择最高 Value 维度对应的动作
-    2. 如果 Value 都低 → 随机探索 (epsilon-greedy)
-    3. 连续 N 步无进步 → 切换策略
+    1. Epsilon-greedy: ε 概率随机探索，(1-ε) 概率选最优动作
+    2. decision tie-break: 多个动作 confidence 相同时随机选
+    3. 自适应: 统计最近 reward 趋势，reward 下降时提高 epsilon
+    
+    修正 (v2):
+    - 移除双重 epsilon（expand + select_best 各检查一次 → 仅 select_best）
+    - 修复 tie-break: 相等时随机选（之前 max 返回第一个 → 总选 action 0）
+    - 动态 epsilon: 无进展时自动提高探索率
     """
-    def __init__(self, n_actions: int = 2, epsilon: float = 0.1):
+    def __init__(self, n_actions: int = 2, epsilon: float = 0.15):
         super().__init__("GymRules")
         self.n_actions = n_actions
         self.epsilon = epsilon
+        self.base_epsilon = epsilon
         self._last_rewards = []
         self._strategy = "exploit"  # exploit | explore
     
@@ -42,36 +49,43 @@ class GymRuleEngine(RuleEngine):
         for idx in range(self.n_actions):
             action = np.zeros((1, max(self.n_actions, 10)), dtype=np.float32)
             action[0, idx] = 1.0
+            # advantage: 相对于最大值的偏移（全相等时为 all 0 → tie）
             advantage = float(decision[idx]) - float(np.max(decision)) if self.n_actions > 1 else 1.0
             confidence = np.clip(0.3 + advantage * 2 + value_scalar * 0.2, 0.1, 0.95)
             
             candidates.append(RuleResult(
                 action=action,
                 confidence=float(confidence),
-                explanation=f"Gym-action={idx}: dec={float(decision[idx]):.3f} adv={advantage:.3f}"
-            ))
-        
-        # 规则 2: Epsilon-greedy 探索
-        if np.random.random() < self.epsilon:
-            explore_idx = np.random.randint(0, self.n_actions)
-            candidates.append(RuleResult(
-                action=candidates[explore_idx].action,
-                confidence=0.2,  # 低置信度 = 探索
-                explanation=f"Explore: random-action={explore_idx}"
+                explanation=f"Gym-action={idx}: dec={float(decision[idx]):.4f} adv={advantage:.3f}"
             ))
         
         return candidates
     
     def select_best(self, ctx: RuleContext, candidates: List[RuleResult]) -> RuleResult:
-        # 多数时间选最高 Value，偶尔探索
-        exploit_candidates = [c for c in candidates if "random" not in c.explanation]
-        explore_candidates = [c for c in candidates if "random" in c.explanation]
+        # 单次 epsilon-greedy 决策
+        if random.random() < self.epsilon:
+            # 探索：随机选一个动作
+            return random.choice(candidates)
         
-        if explore_candidates and np.random.random() < self.epsilon:
-            return explore_candidates[0]
-        if exploit_candidates:
-            return max(exploit_candidates, key=lambda c: c.confidence)
-        return candidates[0]
+        # 利用：选最高 confidence
+        # 修复 tie-break：多个最高 confidence 时随机选
+        max_conf = max(c.confidence for c in candidates)
+        best_candidates = [c for c in candidates if c.confidence >= max_conf - 1e-8]
+        return random.choice(best_candidates)
+    
+    def update_epsilon(self, recent_rewards: list):
+        """根据最近表现动态调整 epsilon"""
+        if len(recent_rewards) < 5:
+            return
+        self._last_rewards = recent_rewards[-10:]
+        avg = float(np.mean(self._last_rewards))
+        # 如果最近表现差（低于随机基线 ~22），提高探索率
+        if avg < 15:
+            self.epsilon = min(0.5, self.base_epsilon * 3)
+        elif avg < 25:
+            self.epsilon = min(0.4, self.base_epsilon * 2)
+        else:
+            self.epsilon = self.base_epsilon
 
 
 # ============================================================
@@ -148,6 +162,7 @@ def run_benchmark(env_name: str = "CartPole-v1", episodes: int = 50) -> Benchmar
         ep_reward = 0
         done = False
         ep_steps = 0
+        ep_actions = []
         
         while not done and ep_steps < 500:
             x = obs_to_input(obs)
@@ -159,6 +174,7 @@ def run_benchmark(env_name: str = "CartPole-v1", episodes: int = 50) -> Benchmar
             else:
                 action = env.action_space.sample()
             
+            ep_actions.append(action)
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             ep_reward += reward
@@ -167,9 +183,15 @@ def run_benchmark(env_name: str = "CartPole-v1", episodes: int = 50) -> Benchmar
         result.neuroflow_rewards.append(ep_reward)
         nf_total_steps += ep_steps
         
+        # 自适应 epsilon（根据最近表现调整探索率）
+        engine.update_epsilon(result.neuroflow_rewards)
+        
         if (ep + 1) % 10 == 0:
             avg = np.mean(result.neuroflow_rewards[-10:])
-            print(f"    Ep {ep+1:3d}/{episodes} | avg_reward={avg:.1f} | best={result.nf_best:.0f}")
+            zeros = ep_actions.count(0)
+            ones = ep_actions.count(1)
+            print(f"    Ep {ep+1:3d}/{episodes} | avg={avg:.1f} | best={result.nf_best:.0f} | "
+                  f"ε={engine.epsilon:.2f} | actions L/R={zeros}/{ones}")
     
     # === Random 基线 ===
     print(f"\n  [Random baseline]")
