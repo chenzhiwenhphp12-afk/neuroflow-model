@@ -544,7 +544,7 @@ class NeuroFlowDaemonV3:
 
         # ── Gated Memory Bank（替代 W_h + W_h2 的隐层加深）──
         # 24个记忆槽，每个256维，减少槽数集中训练强度
-        MEM_SLOTS = 24          # 记忆槽数（从64降至24，提升每槽利用率）
+        MEM_SLOTS = 32          # 记忆槽数（从24升至32，提升容量）
         MEM_DIM_IN = 256        # 键/值维度
         # 记忆键（L2范数=1，投影到单位球面）
         K_init = np.random.randn(MEM_SLOTS, MEM_DIM_IN).astype(np.float32)
@@ -557,7 +557,7 @@ class NeuroFlowDaemonV3:
         self.W_q = np.random.randn(HIDDEN_DIM, MEM_DIM_IN).astype(np.float32) * scale_q
         # 门控: h1(512) → gate(512)
         self.W_gate = np.random.randn(HIDDEN_DIM, HIDDEN_DIM).astype(np.float32) * 0.01
-        self.b_gate = np.zeros((1, HIDDEN_DIM), dtype=np.float32)
+        self.b_gate = np.random.randn(1, HIDDEN_DIM).astype(np.float32) * 0.01  # 随机初始化，避免全负死区
         # 记忆输出投影: MEM_DIM_IN(256) → HIDDEN(512)
         scale_out = np.sqrt(2.0 / MEM_DIM_IN)
         self.W_mem_out = np.random.randn(MEM_DIM_IN, HIDDEN_DIM).astype(np.float32) * scale_out
@@ -880,12 +880,30 @@ class NeuroFlowDaemonV3:
         h3 = np.maximum(h_mem, 0)                          # [N, 512] 最终隐层
         h3_relu = h3  # 一致（已非负）
         
-        # ═══ Sparse Autoencoder 瓶颈：仅保留 top-50 激活 ═══
-        SPARSE_K = 50
+        # ═══ Sparse Autoencoder 自适应稀疏度 (v5.0: 输入熵越高→激活越多) ═══
+        # 基础top-k: 65 (12.7% of 512)
+        K_BASE = 65
+        K_MIN, K_MAX = 40, 120
+        # 计算每个样本的输入熵（近似: softmax分布的离散度）
+        h3_softmax = np.exp(h3_relu - np.max(h3_relu, axis=-1, keepdims=True))
+        h3_softmax = h3_softmax / (np.sum(h3_softmax, axis=-1, keepdims=True) + 1e-8)
+        entropy = -np.sum(h3_softmax * np.log(h3_softmax + 1e-8), axis=-1)  # [N]
+        entropy_norm = entropy / np.log(512)  # 归一化到 [0, 1]
+        # 记忆槽使用率补偿: 活跃槽多→更多SAE通道
+        if hasattr(self, 'mem_usage'):
+            slot_bonus = int(10 * self.mem_usage)  # 最多+10
+        else:
+            slot_bonus = 0
+        k_per_sample = (K_MIN + (K_MAX - K_MIN) * entropy_norm + slot_bonus).astype(np.int32)
+        k_per_sample = np.clip(k_per_sample, K_MIN, K_MAX)
+        # 取平均值作为该batch的统一top-k（稳定训练）
+        K_DYNAMIC = int(np.mean(k_per_sample))
+        
         h3_abs = np.abs(h3_relu)
-        h3_thresh = np.partition(h3_abs, -SPARSE_K, axis=1)[:, -SPARSE_K:-SPARSE_K+1]
+        h3_thresh = np.partition(h3_abs, -K_DYNAMIC, axis=1)[:, -K_DYNAMIC:-K_DYNAMIC+1]
         self._sae_mask = (h3_abs >= h3_thresh).astype(np.float32)
-        h3_relu = h3_relu * self._sae_mask  # 只留最强的50个特征
+        self._sae_k = K_DYNAMIC  # 记录供日志使用
+        h3_relu = h3_relu * self._sae_mask  # 只保留top-K_DYNAMIC个特征
         
         # 输出头
         recon = h3_relu @ self.head.W_d + self.head.b_d  # [N, 1024] 编码重建
@@ -1032,7 +1050,7 @@ class NeuroFlowDaemonV3:
         # W_embed 梯度 (通过输入投影ReLU → W_p反向)
         grad_X_proj = grad_h1_relu @ self.head.W_p.T
         grad_X_proj_relu = grad_X_proj * (X_proj > 0).astype(np.float32)
-        self.W_embed -= shared_lr * ((X_masked.T @ grad_X_proj_relu) + WEIGHT_DECAY * self.W_embed) * 0.1
+        self.W_embed -= shared_lr * ((X_masked.T @ grad_X_proj_relu) + WEIGHT_DECAY * self.W_embed) * 0.3
 
         self.head.n_updates += 1
         self.head.total_loss += loss
@@ -1119,13 +1137,14 @@ class NeuroFlowDaemonV3:
         
         # ── 4. 停滞超过5次 → 执行进化 ──
         if p['stagnation'] >= 5:
+            stag_count = p['stagnation']  # 先保存计数再清零
             p['stagnation'] = 0
-            evolutions_made.append(f"🧬 停滞{p['stagnation']}次，启动自动调参")
+            evolutions_made.append(f"🧬 停滞{stag_count}次，启动自动调参")
             
             # 4a: 对比损失调节
             var = result.get('h_var', 0.0005)
-            if var < 0.0003:
-                p['contrastive'] = min(2.0, p['contrastive'] + 0.2)
+            if var < 0.0006:  # 提高触发阈值，解决var=0.0004死区
+                p['contrastive'] = min(2.5, p['contrastive'] + 0.2)  # 上限2.5
                 evolutions_made.append(f"  var={var:.4f}过低 → 对比{p['contrastive']:.1f}")
             elif var > 0.001:
                 p['contrastive'] = max(0.1, p['contrastive'] - 0.2)
@@ -1216,7 +1235,7 @@ class NeuroFlowDaemonV3:
         print(f"[{datetime.now():%H:%M:%S}] 🧠 NeuroFlow v3 守护进程启动 (ALL-IN-ONE MODE)")
         print(f"[{datetime.now():%H:%M:%S}] 📚 本地知识: 内置{ds['builtin']}条 + {ds['kb_files']}文件")
         print(f"[{datetime.now():%H:%M:%S}] ⚙️  batch={BATCH_SIZE} | workers={PARALLEL_WORKERS} | dims={TEXT_DIM}→{HIDDEN_DIM}→{HIDDEN2_DIM}→{OUTPUT_DIM}+{MEM_DIM}")
-        print(f"[{datetime.now():%H:%M:%S}] 🔄 架构: W_p→ReLU→GatedMemBank(24槽×256→top6)→SAE(top50)→[W_d+W_m+W_v+W_gen({VOCAB_SIZE}词)]")
+        print(f"[{datetime.now():%H:%M:%S}] 🔄 架构: W_embed→W_p→ReLU→GatedMemBank(32槽×256→top6)→SAE(top65/512,12.7%)→[W_d+W_m+W_v+W_gen({VOCAB_SIZE}词)]")
 
         batch_count = 0
         while True:
@@ -1252,7 +1271,7 @@ class NeuroFlowDaemonV3:
                     print(f"  [{topics:7d}] 📦 batch#{batch_count} e{self.data_source.epoch} "
                           f"recon={result['recon_mse']:.6f} word={result.get('word_bce',0):.4f} "
                           f"wce={result.get('word_wce',0):.2f} "
-                          f"var={result.get('h_var',0):.4f} "
+                          f"var={result.get('h_var',0):.4f} k={getattr(self,'_sae_k',65)} "
                           f"fit={self.state['fitness']} | {bar}", flush=True)
 
                 # 定时状态汇报
