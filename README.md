@@ -328,18 +328,18 @@ neuroflow-model/
 
 ## 📦 Weights
 
-The pretrained weights (12.5 MB) are hosted on **Hugging Face**:
+The pretrained weights (12.5 MB) are hosted on **GitHub Release**:
 
 | Weight | Size | Source |
 |--------|------|--------|
-| `neuroflow_weights_v4.npz` | 12.5 MB | [Hugging Face 🤗](https://huggingface.co/chenzhiwenhphp12/neuroflow-v4) |
+| `neuroflow_weights_v4.npz` | 12.5 MB | [GitHub Release 🔗](https://github.com/chenzhiwenhphp12-afk/neuroflow-model/releases/tag/v4.0.0) |
 
 The `Predictor` class auto-downloads on first use. Remove `~/.cache/neuroflow_v4/` to re-download.
 
 To use locally:
 ```bash
 # Download manually
-wget https://huggingface.co/chenzhiwenhphp12/neuroflow-v4/resolve/main/neuroflow_weights_v4.npz
+wget https://github.com/chenzhiwenhphp12-afk/neuroflow-model/releases/download/v4.0.0/neuroflow_weights_v4.npz
 
 # Load
 from neuroflow_v4 import Predictor
