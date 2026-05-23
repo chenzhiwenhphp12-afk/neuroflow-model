@@ -15,7 +15,7 @@ NeuroFlow 自主进化守护进程 v3 — 内置事件循环 + 混合数据源
       或: python3 daemon_v3.py  (前台运行)
 """
 
-import sys, os, time, json, random, numpy as np
+import sys, os, time, json, random, logging, numpy as np
 from datetime import datetime
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -54,13 +54,88 @@ HEAD_ACTIONS = 1024     # 决策头维度 = 全量编码
 MEM_DIM = 256           # C++ retrieved_mem 维度
 MEM_LOSS_WEIGHT = 0.3   # retrieved_mem 损失权重
 CONTRASTIVE_WEIGHT = 1.2    # 对比损失权重（从0.8提升至1.2，增强域间推散力）
+VICREG_VAR_WEIGHT = 2.5     # VICReg方差正则化权重（5x临时提权，加速方差恢复）
+VICREG_GAMMA = 1.0          # VICReg目标标准差阈值（γ，新增）
+# ── 记忆能量泵（Memory Energy Pump）──
+MEM_NORM_PUMP_WEIGHT = 0.5   # M_V范数泵权重：拉||M_V||向1.0
+MEM_NORM_TARGET = 1.0        # M_V目标平均行范数
+MEM_DIVERSITY_WEIGHT = 0.3   # M_V多样性损失权重：推散各槽向量
 VOCAB_SIZE = 500        # 词汇表大小（top 500 高频字符，提高正类密度）
-VOCAB_LOSS_WEIGHT = 0.0     # 词汇预测损失权重（设为0禁用词表头，避免共享层不稳定）
+VOCAB_LOSS_WEIGHT = 0.5     # 词汇预测损失权重（提升至0.5，强梯度恢复词表头）
 VOCAB_POS_WEIGHT = 1.0      # 正类加权（未使用）
 WEIGHT_DECAY = 0.002        # L2权重衰减系数（防止权重无限增长）
 
+# ═══ HPC专属：50%权重核爆破（物理粉碎坍塌吸引子，非Forward/梯度修补） ═══
+HPC_AMPLIFY_ENABLED = False       # 停用核爆（等HPC权重覆盖）
+HPC_FORCE_RAW_GATE = False        # 记忆通路正常
+
 os.makedirs(KB_DIR, exist_ok=True)
+
+# ── 门控温度锐化补丁 ──
+from gate_patch_numpy import DynamicGateSharper
+
 os.environ.setdefault("OMP_NUM_THREADS", "40")
+
+RECOVERY_MODE = True          # 恢复期临时禁用SAE稀疏（全维梯度通过，var恢复后改回False）
+
+# 词表梯度热身控制器（双重锁步热身策略）
+# 阶段1: 隔离期 — 仅调W_gen权重，词表梯度不进入h3共享层
+# 阶段2: Sigmoid渐进释放 — 词表梯度平滑注入h3
+class VocabGradientController:
+    """词表梯度热身控制器 — 防止词表BCE梯度砸碎刚恢复的流形"""
+    def __init__(self, target_h3_weight=0.2, target_wgen_lr_mult=1.0,
+                 warm_up_steps=3000, start_var_threshold=0.1):
+        self.target_h3_weight = target_h3_weight   # 最终注入h3的词表梯度权重
+        self.target_wgen_lr_mult = target_wgen_lr_mult  # W_gen的学习率乘数
+        self.warm_up_steps = warm_up_steps
+        self.start_var_threshold = start_var_threshold
+        self.warm_up_counter = 0
+        self.is_warming_up = False
+        self.active = False
+        self.h3_weight = 0.0     # 当前h3梯度混合权重（phase 2）
+        self.wgen_lr_mult = 0.0  # 当前W_gen学习率乘数（phase 1）
+    
+    def update(self, current_var):
+        """返回 (h3_word_weight, wgen_lr_mult)"""
+        if not self.active and current_var >= self.start_var_threshold:
+            self.active = True
+            self.is_warming_up = True
+            self.warm_up_counter = 0
+            print(f"🔥 [Vocab] var={current_var:.4f} 达标，启动词表梯度热身(3000步Sigmoid)")
+        
+        if not self.active:
+            self.h3_weight = 0.0
+            self.wgen_lr_mult = 0.0
+            return 0.0, 0.0
+        
+        if self.is_warming_up:
+            self.warm_up_counter += 1
+            x = 12.0 * (self.warm_up_counter / self.warm_up_steps) - 6.0
+            sigmoid_factor = 1.0 / (1.0 + np.exp(-x))
+            
+            # 阶段1(wgen_lr_mult先行): W_gen学习率先恢复
+            # 阶段2(h3_weight跟进): 词表梯度再注入共享层
+            self.wgen_lr_mult = sigmoid_factor * self.target_wgen_lr_mult
+            self.h3_weight = max(0.0, sigmoid_factor - 0.5) * 2.0 * self.target_h3_weight
+            # h3_weight在sigmoid_factor<0.5时为0 → 自然隔离
+            
+            if self.warm_up_counter >= self.warm_up_steps:
+                self.is_warming_up = False
+                self.h3_weight = self.target_h3_weight
+                self.wgen_lr_mult = self.target_wgen_lr_mult
+                print(f"✅ [Vocab] 热身完成! h3_w={self.h3_weight:.3f} wgen_lr={self.wgen_lr_mult:.3f}")
+            
+            return self.h3_weight, self.wgen_lr_mult
+        
+        return self.h3_weight, self.wgen_lr_mult
+    
+    def status_str(self):
+        if not self.active:
+            return "未激活"
+        if self.is_warming_up:
+            pct = int(100 * self.warm_up_counter / self.warm_up_steps)
+            return f"热身中({pct}%) h3_w={self.h3_weight:.3f} wgen={self.wgen_lr_mult:.3f}"
+        return f"已就绪 h3_w={self.h3_weight:.3f}"
 
 # ═══════════════════════════════════════════════════════════════
 # 内置本地知识库 — 200+ 跨领域知识点
@@ -508,6 +583,13 @@ class NeuroFlowDaemonV3:
         # 统计
         self.cycle_count = 0
         self.last_status = time.time()
+        
+        # 词表梯度热身控制器（var达标后渐进引入词表损失梯度）
+        self.vocab_controller = VocabGradientController(
+            target_h3_weight=0.2,
+            warm_up_steps=3000,
+            start_var_threshold=0.1
+        )
 
     def _init_model(self):
         """初始化模型 + W_h2加深 + W_gen词汇预测 + vocab加载"""
@@ -557,7 +639,10 @@ class NeuroFlowDaemonV3:
         self.W_q = np.random.randn(HIDDEN_DIM, MEM_DIM_IN).astype(np.float32) * scale_q
         # 门控: h1(512) → gate(512)
         self.W_gate = np.random.randn(HIDDEN_DIM, HIDDEN_DIM).astype(np.float32) * 0.01
-        self.b_gate = np.random.randn(1, HIDDEN_DIM).astype(np.float32) * 0.01  # 随机初始化，避免全负死区
+        self.b_gate = np.random.randn(1, HIDDEN_DIM).astype(np.float32) * 0.01
+        # ── 门控温度锐化（余弦退火） ──
+        self.gate_sharper = DynamicGateSharper(start_tau=0.2, target_tau=1.0, duration_topics=500000)
+        self.gate_tau_active = False  # 初始关闭，等M_V冲上0.5后激活
         # 记忆输出投影: MEM_DIM_IN(256) → HIDDEN(512)
         scale_out = np.sqrt(2.0 / MEM_DIM_IN)
         self.W_mem_out = np.random.randn(MEM_DIM_IN, HIDDEN_DIM).astype(np.float32) * scale_out
@@ -567,9 +652,9 @@ class NeuroFlowDaemonV3:
         self.W_m = np.random.randn(HIDDEN2_DIM, MEM_DIM).astype(np.float32) * scale_m
         self.b_m = np.zeros((1, MEM_DIM), dtype=np.float32)
         
-        # ── 新增：词汇预测头 W_gen ──
-        scale_gen = np.sqrt(2.0 / HIDDEN2_DIM)
-        self.W_gen = np.random.randn(HIDDEN2_DIM, VOCAB_SIZE).astype(np.float32) * scale_gen
+        # ── 词汇预测头 W_gen（HPC除颤：正交初始化粉碎对称性）──
+        Q, _ = np.linalg.qr(np.random.randn(HIDDEN2_DIM, HIDDEN2_DIM).astype(np.float32))
+        self.W_gen = Q[:, :VOCAB_SIZE].astype(np.float32) * 1.5  # (512, 500) 正交列×1.5
         self.b_gen = np.zeros((1, VOCAB_SIZE), dtype=np.float32)
         
         # ── 独立词表头（不共享隐层梯度） ──
@@ -640,7 +725,37 @@ class NeuroFlowDaemonV3:
                                 setattr(getattr(self, parent), child, saved_arr)
             except Exception:
                 pass
-
+        
+        # ═══ 终极方案：50%权重核爆破 — 物理粉碎坍塌吸引子 ═══
+        if HPC_AMPLIFY_ENABLED:
+            print("🚨 [NUCLEAR] 启动50%权重级核爆破！物理粉碎坍塌吸引子...")
+            target_names = ['W_embed', 'W_p', 'W_gate', 'W_mem_out', 'M_K', 'M_V']
+            for name in target_names:
+                if hasattr(self, name):
+                    param = getattr(self, name)
+                    param_std = max(float(np.std(param)), 1e-5)
+                    noise = np.random.randn(*param.shape).astype(np.float32) * (param_std * 0.50)
+                    param += noise
+                    print(f"       💥 已向层 [{name}] 注入 50% 噪声 (std={param_std*0.50:.5f})")
+                elif hasattr(self.head, name):
+                    param = getattr(self.head, name)
+                    param_std = max(float(np.std(param)), 1e-5)
+                    noise = np.random.randn(*param.shape).astype(np.float32) * (param_std * 0.50)
+                    param += noise
+                    print(f"       💥 已向层 [head.{name}] 注入 50% 噪声 (std={param_std*0.50:.5f})")
+                else:
+                    print(f"       ⚠ 未找到层 [{name}] 或 [head.{name}]，跳过")
+            # W_p完全替换为放大随机矩阵（scale×5，提升h3方差至0.01+）
+            W_p_fresh = np.random.randn(TEXT_DIM, HIDDEN_DIM).astype(np.float32) * np.sqrt(2.0/TEXT_DIM) * 5.0
+            self.head.W_p = W_p_fresh
+            print(f"       🔄 层 [head.W_p] 完全替换为放大5x随机矩阵 (scale={np.sqrt(2.0/TEXT_DIM)*5:.5f})")
+            # W_gen: 强正交化(gain=1.5) + bias清零
+            Q, _ = np.linalg.qr(np.random.randn(HIDDEN2_DIM, HIDDEN2_DIM).astype(np.float32))
+            self.W_gen = Q[:, :VOCAB_SIZE].astype(np.float32) * 1.5
+            self.b_gen = np.zeros((1, VOCAB_SIZE), dtype=np.float32)
+            print(f"       🔮 W_gen 正交重置 gain=1.5, bias清零")
+            print("✅ [NUCLEAR] 拓扑流形物理粉碎完毕。")
+    
     def _save_state(self):
         """保存状态"""
         self.state["source_stats"] = self.state.get("source_stats", {})
@@ -734,8 +849,13 @@ class NeuroFlowDaemonV3:
         scores_exp_v = scores_exp_v * (scores_exp_v >= scores_topk_v)
         attn_v = scores_exp_v / (np.sum(scores_exp_v, axis=1, keepdims=True) + 1e-8)
         mem_read_v = attn_v @ self.M_V
+        # ═══ 二阶段词表头训练 ═══
         mem_feat_v = mem_read_v @ self.W_mem_out
-        gate_v = 1.0 / (1.0 + np.exp(-(h1_relu @ self.W_gate + self.b_gate)))
+        gate_logits_v = h1_relu @ self.W_gate + self.b_gate
+        if self.gate_tau_active:
+            gate_v = self.gate_sharper.patch_forward(gate_logits_v)
+        else:
+            gate_v = 1.0 / (1.0 + np.exp(-gate_logits_v))
         h_mem_v = gate_v * h1_relu + (1.0 - gate_v) * mem_feat_v
         h3 = np.maximum(h_mem_v, 0)
         
@@ -875,17 +995,31 @@ class NeuroFlowDaemonV3:
         mem_read = attn @ self.M_V                       # [N, 256] 读记忆值
         mem_feat = mem_read @ self.W_mem_out             # [N, 512] 投影到隐层
         # 门控融合: 学习每个维度该用多少原始特征 vs 记忆
-        gate = 1.0 / (1.0 + np.exp(-(h1_relu @ self.W_gate + self.b_gate)))  # [N, 512]
+        # ── 门控计算（可选温度锐化）──
+        gate_logits = h1_relu @ self.W_gate + self.b_gate
+        if self.gate_tau_active:
+            tau = self.gate_sharper.step(self.state['train_steps'])
+            gate = self.gate_sharper.patch_forward(gate_logits)
+        else:
+            gate = 1.0 / (1.0 + np.exp(-gate_logits))  # [N, 512]
+        if HPC_FORCE_RAW_GATE:
+            gate.fill(1.0)  # 旁路记忆坍塌，100%原始特征
         h_mem = gate * h1_relu + (1.0 - gate) * mem_feat   # [N, 512] 门控融合
         h3 = np.maximum(h_mem, 0)                          # [N, 512] 最终隐层
         h3_relu = h3  # 一致（已非负）
+        
+        # ═══ LayerNorm 前归一化（修复：低方差下SAE随机路由问题）═══
+        # 将 h3 归一化为标准正态，确保SAE的top-k选择基于相对结构而非噪声幅度
+        h3_mean = np.mean(h3_relu, axis=1, keepdims=True)
+        h3_std = np.std(h3_relu, axis=1, keepdims=True) + 1e-5
+        h3_normed = (h3_relu - h3_mean) / h3_std  # [N, 512] ~ N(0,1)
         
         # ═══ Sparse Autoencoder 自适应稀疏度 (v5.0: 输入熵越高→激活越多) ═══
         # 基础top-k: 65 (12.7% of 512)
         K_BASE = 65
         K_MIN, K_MAX = 40, 120
-        # 计算每个样本的输入熵（近似: softmax分布的离散度）
-        h3_softmax = np.exp(h3_relu - np.max(h3_relu, axis=-1, keepdims=True))
+        # 使用归一化后的值计算熵（消除幅度影响）
+        h3_softmax = np.exp(h3_normed - np.max(h3_normed, axis=-1, keepdims=True))
         h3_softmax = h3_softmax / (np.sum(h3_softmax, axis=-1, keepdims=True) + 1e-8)
         entropy = -np.sum(h3_softmax * np.log(h3_softmax + 1e-8), axis=-1)  # [N]
         entropy_norm = entropy / np.log(512)  # 归一化到 [0, 1]
@@ -899,11 +1033,16 @@ class NeuroFlowDaemonV3:
         # 取平均值作为该batch的统一top-k（稳定训练）
         K_DYNAMIC = int(np.mean(k_per_sample))
         
-        h3_abs = np.abs(h3_relu)
-        h3_thresh = np.partition(h3_abs, -K_DYNAMIC, axis=1)[:, -K_DYNAMIC:-K_DYNAMIC+1]
-        self._sae_mask = (h3_abs >= h3_thresh).astype(np.float32)
+        h3_normed_abs = np.abs(h3_normed)
+        h3_thresh = np.partition(h3_normed_abs, -K_DYNAMIC, axis=1)[:, -K_DYNAMIC:-K_DYNAMIC+1]
+        self._sae_mask = (h3_normed_abs >= h3_thresh).astype(np.float32)
         self._sae_k = K_DYNAMIC  # 记录供日志使用
-        h3_relu = h3_relu * self._sae_mask  # 只保留top-K_DYNAMIC个特征
+        # 恢复期暂时跳过SAE mask（全512维通过，加速var恢复）
+        if not RECOVERY_MODE:
+            h3_relu = h3_relu * self._sae_mask
+        
+        # ═══ HPC专属：输入嵌入层噪声注入（打破对称坍塌，通过全路径传播） ═══
+        # [已移除: 前7轮证明Forward/梯度层面修补无效，改用权重级核爆破]
         
         # 输出头
         recon = h3_relu @ self.head.W_d + self.head.b_d  # [N, 1024] 编码重建
@@ -965,19 +1104,43 @@ class NeuroFlowDaemonV3:
         h_var = float(np.mean(h_centered ** 2))
         contrastive_loss = -CONTRASTIVE_WEIGHT * h_var
         
+        # ═══ 记忆能量泵 Loss ═══
+        # M_V范数泵：目标每行范数 = MEM_NORM_TARGET
+        mv_row_norms = np.linalg.norm(self.M_V, axis=1)  # [32]
+        mv_mean_norm = float(np.mean(mv_row_norms))
+        mem_norm_pump = MEM_NORM_PUMP_WEIGHT * max(0, MEM_NORM_TARGET - mv_mean_norm)
+        # M_V多样性：每槽差异度（推散各槽向量）
+        M_V_centered = self.M_V - np.mean(self.M_V, axis=0, keepdims=True)
+        mv_var = float(np.mean(M_V_centered ** 2))
+        mem_diversity = -MEM_DIVERSITY_WEIGHT * mv_var
+        # 总能量泵损失（仅监控，梯度手动注入M_V更新）
+        mem_pump_full = mem_norm_pump + mem_diversity
+        
         loss = recon_mse + MEM_LOSS_WEIGHT * mem_mse + 0.1 * val_mse + contrastive_loss + VOCAB_LOSS_WEIGHT * word_bce
 
         # 记录MSE供进化
         if not hasattr(self, '_recent_mse'):
             self._recent_mse = []
+            self._recent_var = []
+            self._recent_word_bce = []
         self._recent_mse.append(recon_mse)
+        self._recent_var.append(h_var)
+        self._recent_word_bce.append(word_bce)
 
         # 梯度计算 — word用无加权BCE梯度保证稳定
         grad_recon = 2 * (recon - Y) / N                         # [N, 1024]
         grad_mem = 2 * MEM_LOSS_WEIGHT * (mem_pred - M) / N       # [N, 256]
         grad_val = 2 * 0.1 * (val - r_arr) / N                    # [N, 1]
-        grad_word = VOCAB_LOSS_WEIGHT * (word_sigmoid - c_batch) / N  # [N, 500] 无加权BCE梯度
-
+        
+        # ═══ 词表梯度热身：双重锁步 ═══
+        # h3_weight: 词表梯度注入共享层的权重（phase 2）
+        # wgen_lr_mult: W_gen学习率乘数（phase 1先行）
+        h3_word_weight, wgen_lr_mult = self.vocab_controller.update(h_var)
+        
+        # 词表梯度（始终满梯度计算，但分两路）
+        grad_word_raw = (word_sigmoid - c_batch) / N  # [N, 500] 原始BCE梯度
+        grad_word = h3_word_weight * grad_word_raw     # 注入h3的梯度（phase 2渐进）
+        
         # 输出层更新 (使用 h3_relu, +L2 weight decay)
         self.head.W_d -= lr * ((h3_relu.T @ grad_recon) + WEIGHT_DECAY * self.head.W_d)
         self.head.b_d -= lr * np.sum(grad_recon, axis=0, keepdims=True)
@@ -985,24 +1148,39 @@ class NeuroFlowDaemonV3:
         self.b_m -= lr * np.sum(grad_mem, axis=0, keepdims=True)
         self.head.W_v -= lr * (0.1 * (h3_relu.T @ grad_val) + WEIGHT_DECAY * self.head.W_v)
         self.head.b_v -= lr * 0.1 * np.sum(grad_val, axis=0, keepdims=True)
-        self.W_gen -= lr * ((h3_relu.T @ grad_word) + WEIGHT_DECAY * self.W_gen)
-        self.b_gen -= lr * np.sum(grad_word, axis=0, keepdims=True)
+        # W_gen: 始终满梯度更新（不受h3_word_weight限制），仅受wgen_lr_mult控速
+        self.W_gen -= lr * wgen_lr_mult * ((h3_relu.T @ grad_word_raw) + WEIGHT_DECAY * self.W_gen)
+        self.b_gen -= lr * wgen_lr_mult * np.sum(grad_word_raw, axis=0, keepdims=True)
 
         # 对比损失梯度（推散隐状态）
         grad_contrastive = -2 * CONTRASTIVE_WEIGHT / N * h_centered  # [N, 512]
 
+        # ═══ VICReg方差正则化梯度（逐维度标准差铰链损失）═══
+        per_dim_std = np.sqrt(np.mean(h_centered ** 2, axis=0) + 1e-4)  # [D]
+        vicreg_mask = (per_dim_std < VICREG_GAMMA).astype(np.float32)   # [D] hinge mask
+        vicreg_grad = -VICREG_VAR_WEIGHT / N * h_centered / (per_dim_std + 1e-8) * vicreg_mask  # [N, D]
+
+        # ═══ 恢复期：直接噪声注入h3提升方差（跳过所有补偿机制）═══
+        if RECOVERY_MODE:
+            # 高斯噪声直接注入h3，迫使模型学习区分信号vs噪声
+            noise_std = 0.05 * np.clip(1.0 - h_var * 100, 0.05, 1.0)  # var越低噪声越大
+            h3_relu += np.random.randn(*h3_relu.shape).astype(np.float32) * noise_std
+
         # Gated Memory Bank 梯度（替代 W_h2 → W_h 的反向传播）
         grad_h3 = (grad_recon @ self.head.W_d.T) + (grad_mem @ self.W_m.T) \
                  + (grad_val @ self.head.W_v.T) * 0.1 + (grad_word @ self.W_gen.T)
-        grad_h3 += grad_contrastive
-        # SAE 稀疏掩码梯度：仅 top-50 特征能反向传播
-        if hasattr(self, '_sae_mask'):
+        grad_h3 += grad_contrastive  # 对比度梯度
+        # SAE 稀疏掩码梯度（恢复期跳过）
+        if hasattr(self, '_sae_mask') and not RECOVERY_MODE:
             grad_h3 = grad_h3 * self._sae_mask
             self._sae_mask = None  # 用后清理
-        # 梯度裁剪: 限制范数 ≤ 1.0 防止爆炸
+        elif RECOVERY_MODE:
+            self._sae_mask = None  # 恢复期只清理不mask
+        # ═══ 梯度裁剪 ═══
         h3_norm = np.linalg.norm(grad_h3)
         if h3_norm > 1.0:
             grad_h3 *= 1.0 / h3_norm
+        # VICReg梯度推散已通过直接W_p注入完成，不再添加至grad_h3
         
         # h3 = ReLU(h_mem) → grad_h_mem = grad_h3 * (h_mem > 0)
         grad_h_mem = grad_h3 * (h_mem > 0).astype(np.float32)
@@ -1010,8 +1188,11 @@ class NeuroFlowDaemonV3:
         # ── 门控路径梯度 ──
         # h_mem = gate * h1_relu + (1-gate) * mem_feat
         d_gate = grad_h_mem * (h1_relu - mem_feat)
-        # gate = sigmoid(h1_relu @ W_gate + b_gate)
-        d_sigmoid = d_gate * gate * (1.0 - gate)
+        # gate = sigmoid(gate_logits / τ) 的链式法则
+        if self.gate_tau_active:
+            d_sigmoid = self.gate_sharper.patch_backward(d_gate, gate)
+        else:
+            d_sigmoid = d_gate * gate * (1.0 - gate)
         self.W_gate -= shared_lr * ((h1_relu.T @ d_sigmoid) + WEIGHT_DECAY * self.W_gate)
         self.b_gate -= shared_lr * np.sum(d_sigmoid, axis=0, keepdims=True)
         # h1 通过 gate 路径的梯度
@@ -1026,7 +1207,28 @@ class NeuroFlowDaemonV3:
         
         # mem_read = attn @ M_V
         d_attn = d_mem_read @ self.M_V.T
-        self.M_V -= shared_lr * ((attn.T @ d_mem_read) + WEIGHT_DECAY * self.M_V)
+        # ═══ 记忆能量泵梯度注入 M_V ═══
+        # 范数泵梯度：指向放大方向（梯度下降取负→推离原点）
+        mv_row_norms = np.linalg.norm(self.M_V, axis=1, keepdims=True) + 1e-8
+        mv_norm_grad = -MEM_NORM_PUMP_WEIGHT * self.M_V / mv_row_norms  # 负号=推离原点
+        mv_norm_grad *= (mv_row_norms < MEM_NORM_TARGET).astype(np.float32)
+        # 多样性梯度：推散各槽
+        M_V_centered = self.M_V - np.mean(self.M_V, axis=0, keepdims=True)
+        mv_div_grad = -2 * MEM_DIVERSITY_WEIGHT / 32 * M_V_centered
+        # 合并能量泵梯度
+        mv_pump_grad = mv_norm_grad + mv_div_grad
+        self.M_V -= shared_lr * ((attn.T @ d_mem_read) + WEIGHT_DECAY * self.M_V + mv_pump_grad)
+        
+        # ═══ 门控温控自动激活（M_V已达稳定态且gate_std<0.03）═══
+        if not self.gate_tau_active:
+            mv_now = float(np.mean(np.linalg.norm(self.M_V, axis=1)))
+            gate_std_now = float(np.std(gate))
+            if mv_now >= 0.3 and gate_std_now < 0.03:
+                self.gate_tau_active = True
+                self.gate_sharper = DynamicGateSharper(
+                    start_tau=0.2, target_tau=1.0, duration_topics=500000
+                )
+                print(f"  🔥 [GATE] M_V={mv_now:.3f}≥0.3 且 gate_σ={gate_std_now:.4f}<0.03 → 激活温控退火!", flush=True)
         
         # attn = softmax(top-8 scores * temp) 的梯度
         d_scores_raw = temp * attn * (d_attn - np.sum(attn * d_attn, axis=1, keepdims=True))
@@ -1071,17 +1273,59 @@ class NeuroFlowDaemonV3:
         }
 
     def _evolve(self):
-        """自我进化 — 使用最近MSE作为适应度"""
+        """自我进化 — 使用最近MSE作为适应度，加入var惩罚防止表征坍塌"""
         # 从最近N次训练的平均MSE计算适应度
         recent_mse = getattr(self, '_recent_mse', None)
+        recent_var = getattr(self, '_recent_var', None)
+        recent_word = getattr(self, '_recent_word_bce', None)
+        
+        # 基础fitness = 1/(1+avg_mse)
         if recent_mse is not None and len(recent_mse) > 0:
             avg_mse = sum(recent_mse) / len(recent_mse)
-            fitness = round(1.0 / (1.0 + avg_mse), 4)
+            fitness_base = 1.0 / (1.0 + avg_mse)
         else:
-            fitness = 0.5
+            fitness_base = 0.5
+        
+        # ═══ 表征坍塌检测：var惩罚 + word_bce陷阱检测 ═══
+        collapse_penalty = 1.0
+        collapse_flags = []
+        
+        # 1) 方差惩罚：var接近0 → 表征坍塌
+        if recent_var is not None and len(recent_var) > 0:
+            avg_var = sum(recent_var) / len(recent_var)
+            if avg_var < 1e-6:  # 完全坍塌
+                collapse_penalty *= 0.0
+                collapse_flags.append("var=0完全坍塌")
+            elif avg_var < 0.0002:  # 严重坍塌
+                collapse_penalty *= min(1.0, avg_var / 0.0005)
+                collapse_flags.append(f"var={avg_var:.4f}严重坍塌")
+            elif avg_var < 0.0006:  # 低方差警告
+                collapse_penalty *= min(1.0, avg_var / 0.001)
+                collapse_flags.append(f"var={avg_var:.4f}偏低")
+        
+        # 2) word_bce陷阱检测：≈0.693 = 均匀分布退化
+        if recent_word is not None and len(recent_word) > 0:
+            avg_word = sum(recent_word) / len(recent_word)
+            if abs(avg_word - 0.693) < 0.003:
+                collapse_penalty *= 0.3  # 重度惩罚
+                collapse_flags.append("word≈0.693均匀分布退化")
+            elif abs(avg_word - 0.693) < 0.05:
+                collapse_penalty *= 0.6
+        
+        # 应用惩罚
+        fitness = round(fitness_base * collapse_penalty, 4)
+        
+        # 如果坍塌严重，直接归零
+        if collapse_penalty < 0.1:
+            fitness = 0.0
+        
         self._recent_mse = []  # 重置，重新收集
+        self._recent_var = []
+        self._recent_word_bce = []
         self.state["evolutions"] += 1
         self.state["fitness"] = fitness
+        if collapse_flags:
+            logging.warning(f"🧬 进化: fitness={fitness} 坍塌标志: {'; '.join(collapse_flags)}")
         return fitness
 
     def _auto_evolve(self, result: dict):
@@ -1141,23 +1385,67 @@ class NeuroFlowDaemonV3:
             p['stagnation'] = 0
             evolutions_made.append(f"🧬 停滞{stag_count}次，启动自动调参")
             
+            var = result.get('h_var', 0.0005)
+            
+            # ═══ 4c: 表征坍塌/深度停滞检测 ═══
+            word = result.get('word_bce', 1.0)
+            recon = result.get('recon_mse', 0.001)
+            # 完全坍塌：var≈0 或 word≈0.693+recon极低
+            is_collapsed = (var < 1e-8) or (abs(word - 0.693) < 0.005 and recon < 0.0005)
+            # 深度停滞：var<0.01且recon连续无改善（40K batch稀释陷阱）
+            is_deep_stuck = (var < 0.01) and (p['stagnation'] >= 8)
+            
+            if is_collapsed:
+                evolutions_made.append("🚨 检测到表征坍塌！执行权重扰动唤醒")
+                pert_std = 0.05  # 扰动幅度5%
+                # 扰动Embedding层（最重要：打破输入编码对称性）
+                noise_e = np.random.randn(*self.W_embed.shape).astype(np.float32) * pert_std
+                self.W_embed += noise_e
+                evolutions_made.append(f"  W_embed: ∓{pert_std:.3f}噪声 (||n||={np.linalg.norm(noise_e)/np.sqrt(noise_e.size):.4f})")
+                # 扰动投影层 W_p
+                self.head.W_p += np.random.randn(*self.head.W_p.shape).astype(np.float32) * pert_std
+                # 扰动记忆槽
+                self.M_K += np.random.randn(*self.M_K.shape).astype(np.float32) * pert_std * 0.5
+                self.M_K = self.M_K / (np.linalg.norm(self.M_K, axis=1, keepdims=True) + 1e-8)
+                self.M_V += np.random.randn(*self.M_V.shape).astype(np.float32) * pert_std * 0.5
+                # 扰动门控层
+                self.W_gate += np.random.randn(*self.W_gate.shape).astype(np.float32) * pert_std
+                self.b_gate += np.random.randn(*self.b_gate.shape).astype(np.float32) * pert_std * 0.3
+                # 重置
+                p['contrastive'] = min(5.0, CONTRASTIVE_WEIGHT * 2.0)
+                p['noise'] = 0.15
+                p['best_recon'] = float('inf')
+                self._recent_mse = []
+                if hasattr(self, '_evo_history'):
+                    self._evo_history.clear()
+                evolutions_made.append(f"  对比→{p['contrastive']:.1f} 噪声→{p['noise']:.2f} 全部参数扰动{pert_std}")
+            
+            elif is_deep_stuck:
+                evolutions_made.append("⛰️ 深度停滞(var<0.01)，轻量扰动+符号梯度解除稀释陷阱")
+                pert_std = 0.02  # 仅2%扰动
+                # 仅扰动W_embed和门控层（不动记忆槽）
+                self.W_embed += np.random.randn(*self.W_embed.shape).astype(np.float32) * pert_std
+                self.W_gate += np.random.randn(*self.W_gate.shape).astype(np.float32) * pert_std * 0.5
+                self.b_gate += np.random.randn(*self.b_gate.shape).astype(np.float32) * pert_std * 0.3
+                p['stagnation'] = max(0, p['stagnation'] // 2)
+                p['contrastive'] = min(5.0, p['contrastive'] * 1.5)
+                evolutions_made.append(f"  W_embed+gate扰动{pert_std:.3f} 对比→{p['contrastive']:.1f}")
+            
             # 4a: 对比损失调节
             var = result.get('h_var', 0.0005)
             if var < 0.0006:  # 提高触发阈值，解决var=0.0004死区
                 p['contrastive'] = min(2.5, p['contrastive'] + 0.2)  # 上限2.5
                 evolutions_made.append(f"  var={var:.4f}过低 → 对比{p['contrastive']:.1f}")
-            elif var > 0.001:
-                p['contrastive'] = max(0.1, p['contrastive'] - 0.2)
-                evolutions_made.append(f"  var={var:.4f}过高 → 对比{p['contrastive']:.1f}")
+            elif var > 0.001:  # var足够高→降低对比，保护词表头
+                p['contrastive'] = max(0.5, p['contrastive'] - 0.2)  # 下限0.5
+                evolutions_made.append(f"  var={var:.4f}已够高 → 对比{p['contrastive']:.1f} 保护词表头")
+                # 噪声注入
+                if p['noise'] < 0.15:
+                    old_noise = p['noise']
+                    p['noise'] = min(0.3, p['noise'] + 0.05)
+                    evolutions_made.append(f"  噪声: {old_noise}→{p['noise']:.2f}")
             
-            # 4b: 噪声注入（帮助跳出局部最优）
-            if p['noise'] < 0.15:
-                # 暂时增大噪声
-                old_noise = p['noise']
-                p['noise'] = min(0.3, p['noise'] + 0.05)
-                evolutions_made.append(f"  噪声: {old_noise}→{p['noise']:.2f}")
-            
-            # 更新全局变量（通过修改模块变量）
+            # 更新全局变量
             import daemon_v3 as _self_mod
             _self_mod.CONTRASTIVE_WEIGHT = p['contrastive']
             _self_mod.INPUT_NOISE = p['noise']
