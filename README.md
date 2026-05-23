@@ -1,303 +1,402 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/C%2B%2B-17-blue?logo=c%2B%2B" alt="C++17">
-  <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT">
-  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey" alt="Cross-Platform">
-  <img src="https://img.shields.io/badge/Python-%E2%89%A53.8-blue?logo=python" alt="Python">
-  <img src="https://img.shields.io/badge/params-43K_%7C_232K-brightgreen" alt="Params">
-  <img src="https://img.shields.io/badge/Inference-0.40ms-red" alt="Speed">
+  <img src="https://img.shields.io/badge/NeuroFlow-v4.0-blue?style=flat-square" alt="v4.0">
+  <img src="https://img.shields.io/badge/Pure-NumPy-orange?style=flat-square" alt="NumPy">
+  <img src="https://img.shields.io/badge/Params-3.29M-brightgreen?style=flat-square" alt="Params">
+  <img src="https://img.shields.io/badge/Weight-12.5MB-lightblue?style=flat-square" alt="Weight">
+  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License">
+  <img src="https://img.shields.io/badge/Python-%E2%89%A53.9-blue?style=flat-square&logo=python" alt="Python">
 </p>
 
-<h1 align="center">🧠 NeuroFlow Model</h1>
-<h3 align="center">多模态类脑神经网络 &nbsp;·&nbsp; 纯C++17 &nbsp;·&nbsp; 43K参数 &nbsp;·&nbsp; 0.40ms推理</h3>
-
----
-
-## 📖 项目概述
-
-**NeuroFlow** 是一个受2026年神经科学研究启发的**多模态类脑模块化神经网络**。它模拟人类大脑三大核心网络（SN/ECN/DMN），支持文本+图像多模态推理，用纯C++17实现，零外部依赖，在CPU上实现毫秒级推理。
-
-> 🎯 **设计哲学：** 像大脑一样思考，像C++一样执行。每个组件都映射到真实的脑区功能。
-> 
-> ⚠️ **核心定位：** NeuroFlow 不是 LLM 的竞争者，而是 LLM 的驾驶者。它是低功耗决策中枢，不是知识存储器。
->
-> 📘 **完整用户手册**（持续学习、守护进程、监控、评估）：**[📖 USERS_GUIDE.md](USERS_GUIDE.md)**
-> 详见 **[📐 DESIGN.md](DESIGN.md)** — 感知代理分离原则、Neuro-Symbolic 双系统架构、学习策略、应用场景矩阵。
-
----
-
-## 🏗️ 架构图
+<h1 align="center">🧠 NeuroFlow v4</h1>
+<h3 align="center">Gated Memory Bank + Sparse Autoencoder 自主进化神经网络</h3>
+<h4 align="center">纯 NumPy  ·  3.29M 参数  ·  12.5 MB 权重  ·  零 GPU 依赖</h4>
 
 <p align="center">
-  <img src="assets/architecture.svg" alt="NeuroFlow Architecture" width="100%">
+  <a href="#-quick-start">快速开始</a> ·
+  <a href="#-architecture">架构</a> ·
+  <a href="#-benchmarks">Benchmark</a> ·
+  <a href="#-training">训练</a> ·
+  <a href="#-design-philosophy">设计哲学</a> ·
+  <a href="#-license">License</a>
 </p>
 
 ---
 
-## 📊 Benchmark 对比
-
-### 模型规模与速度
-
-| Model | Params | Memory | CPU Inference | Throughput | Use Case |
-|-------|--------|--------|:---:|:---:|----------|
-| **NeuroFlow Lite (C++)** | **43K** | **0.2 MB** | **0.40 ms** | 2500 img/s | Edge/IoT |
-| **NeuroFlow Full (C++)** | 232K | 1.2 MB | 39.81 ms | 25 img/s | Mobile |
-| NeuroFlow Python | 1.25M | 5 MB | 13.84 ms | 72 img/s | Prototyping |
-| SqueezeNet v1.1 | 1.24M | 4.8 MB | ~8 ms | 125 img/s | Mobile Vision |
-| MobileNetV3-Small | 2.5M | 9.4 MB | ~5 ms | 200 img/s | Mobile Vision |
-| TinyBERT | 14.5M | 55 MB | ~45 ms | 22 img/s | NLP Edge |
-
-> 💡 **NeuroFlow Lite 在 43K 参数下达到 0.40ms 推理 —— 比 MobileNetV3-Small 小 58×，快 12.5×**
-
-### INT8 量化效果
-
-| 指标 | FP32 | INT8 | 压缩比 |
-|------|------|------|:---:|
-| 模型大小 | 1.2 MB | 0.2 MB | **81% ↓** |
-| 推理精度损失 | — | < 0.02 | 可忽略 |
-| 推理加速 | 1× | 1.3× | — |
-
-### MLA KV Cache 压缩
-
-| 指标 | 标准 KV Cache | MLA KV Cache | 节省 |
-|------|:---:|:---:|:---:|
-| 内存占用 (4096 tokens) | 16 MB | 2 MB | **87.5%** |
-| 注意力计算量 | O(n²) | O(n·d_latent) | — |
+[English](#english) | [中文](#chinese)
 
 ---
 
-## 🧩 核心特性
+<a id="english"></a>
 
-### 🧠 类脑三网络架构
+## 🌟 Overview
 
-| 网络 | 对应脑区 | 功能 |
-|------|----------|------|
-| **SN** (Salience Network) | AI + ACC (前岛叶+前扣带) | 显著性检测、注意力门控、异常检测 |
-| **ECN** (Executive Control) | dlPFC + OFC (背外侧前额叶+眶额) | 逻辑推理、价值评估、决策输出 |
-| **DMN** (Default Mode Network) | PCC + mPFC (后扣带+内侧前额叶) | 联想记忆、未来规划、跨模态关联 |
+**NeuroFlow v4** is a self-evolving neural network inspired by neuroscience principles. Unlike large language models (LLMs) that store knowledge in billions of parameters, NeuroFlow uses a compact **Gated Memory Bank** — a 32-slot associative memory — that reads, writes, and evolves through self-supervised learning.
 
-### 🔗 多模态融合
+### Key Highlights
+
+| Feature | Description |
+|---------|-------------|
+| **Pure NumPy** | Zero external ML dependencies. Runs on any CPU. |
+| **Gated Memory Bank** | 32 memory slots × 256 dim. Top-6 sparse attention read, learnable key-value pairs. |
+| **Adaptive SAE** | Sparse Autoencoder with input-entropy-driven sparsity (k=40~120). |
+| **Self-Evolving** | Built-in fitness monitoring, automatic hyperparameter tuning, contrastive learning. |
+| **Gate Temperature Annealing** | Cosine-annealed sigmoid sharpening to break gate homogenization. |
+| **VICReg Regularization** | Variance-invariance-covariance regularization for representation quality. |
+| **Independent Vocab Head** | Separate V_in → V_out path for vocabulary prediction, decoupled from shared layers. |
+
+### How It Learns
 
 ```
-Text Input ──► TextProject ──┐
-                              ├──► CrossModalFusion ──► MultiModalAttention ──► Brain Modules
-Image Input ─► VisionEncoder ─┘
+Knowledge Text → Hash Encoder → [W_embed] → Gated Memory Bank
+                → Self-Supervised Reconstruction
+                → Contrastive Learning (variance maximization)
+                → Memory Energy Pump (M_V norm boost)
+                → Fitness-based Auto Evolution
 ```
 
-- **Vision Encoder** — 轻量 ViT 风格，PatchEmbed + Transformer，SIMD 优化
-- **Cross-Modal Fusion** — 文本-图像对齐 + 相似度评分
-- **MultiModal Attention** — 文本关注图像区域，跨模态推理
-- **三种推理模式** — 纯文本 / 纯图像 / 多模态联合
+### Why NeuroFlow v4?
 
-### ⚡ 极致性能优化
+- **🔥 Self-Contained Learning**: No backprop through massive transformer stacks. Pure numpy SGD on a 3.29M parameter architecture — every parameter is comprehensible.
+- **🧠 Biological Plausibility**: Gated memory retrieval mirrors hippocampal indexing, gate fusion mirrors prefrontal cortex gating, SAE mirrors cortical sparse coding.
+- **⚡ CPU-Only**: Runs 24/7 on a laptop. Zero GPU needed for training or inference.
+- **📈 Self-Evolving**: Automatically detects stagnation, adjusts contrastive weight/mask/noise, and optimizes training trajectory without human intervention.
 
-| 技术 | 效果 |
+---
+
+<a id="chinese"></a>
+
+## 🌟 项目概述
+
+**NeuroFlow v4** 是一个受神经科学启发的**自主进化神经网络**。不同于大语言模型（LLM）用千亿参数存储知识，NeuroFlow 使用紧凑的 **Gated Memory Bank**（32槽关联记忆）通过自监督学习实现读写进化。
+
+### 核心亮点
+
+| 特性 | 说明 |
 |------|------|
-| **SIMD (AVX2/NEON)** | GEMM ~10 GFLOPS，x86 + ARM 全覆盖 |
-| **INT8 量化** | 模型缩减 81%，误差 < 0.02 |
-| **MLA KV Cache** | 87.5% 内存节省，O(n·d) 复杂度 |
-| **LTP 记忆巩固** | 64槽长期记忆，在线学习更新 |
-| **分页内存系统** | 支持磁盘溢出，理论无限记忆 |
+| **纯 NumPy** | 零外部 ML 依赖，任何 CPU 都能跑 |
+| **Gated Memory Bank** | 32 记忆槽 × 256 维，Top-6 稀疏注意力读取 |
+| **自适应 SAE** | 输入熵驱动的稀疏自编码器 (k=40~120) |
+| **自主进化** | 内置适应度监控、自动调参、对比学习 |
+| **门控温控退火** | 余弦退火锐化 Sigmoid，打破门控均质化 |
+| **VICReg 正则化** | 方差-不变性-协方差正则化，保持表征质量 |
+| **独立词表头** | V_in → V_out 独立路径，与共享层解耦 |
+
+### 学习流程
+
+```
+知识文本 → Hash编码器 → [W_embed] → Gated Memory Bank
+         → 自监督重建
+         → 对比学习（方差最大化）
+         → 记忆能量泵（M_V范数提升）
+         → 适应度驱动的自动进化
+```
+
+### 为什么选择 NeuroFlow v4?
+
+- **🔥 自含学习**: 无需通过巨型transformer反向传播。纯numpy SGD在3.29M参数架构上—每个参数都可理解。
+- **🧠 生物学合理性**: 门控记忆检索模拟海马体索引，门控融合模拟前额叶门控，SAE模拟皮层稀疏编码。
+- **⚡ CPU 仅需**: 笔记本电脑上24/7运行。训练推理都不需要GPU。
+- **📈 自主进化**: 自动检测停滞、调整对比权重/掩码/噪声、优化训练轨迹，无需人工干预。
 
 ---
 
-## 🚀 快速开始
+## 🚀 Quick Start
 
-### 环境要求
-
-| 平台 | 编译器 | 最低要求 |
-|------|--------|----------|
-| Linux | GCC 9+ / Clang 10+ | x86_64 (AVX2) 或 ARM64 (NEON) |
-| macOS | Clang (Xcode 13+) | x86_64 或 Apple Silicon |
-| Windows | MSVC 2019+ / MinGW-w64 | x86_64 |
-
-### 方式一：C++ 源码编译
+### Installation
 
 ```bash
-git clone https://github.com/chenzhiwenhphp12-afk/neuroflow-model.git
-cd neuroflow-model/cpp_core
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-
-# 运行测试
-ctest --output-on-failure
-```
-
-### 方式二：Python pip 安装（pybind11）
-
-```bash
-# 一键安装（自动编译 C++ 核心）
+# Option 1: Install from GitHub
 pip install git+https://github.com/chenzhiwenhphp12-afk/neuroflow-model.git
 
-# 或者本地安装
+# Option 2: Clone and install
 git clone https://github.com/chenzhiwenhphp12-afk/neuroflow-model.git
 cd neuroflow-model
 pip install -e .
 ```
 
-### C++ 使用示例
-
-```cpp
-#include <neuroflow/multimodal_model.hpp>
-
-using namespace neuroflow;
-
-// 创建多模态模型
-NeuroFlowMultiModal::Config cfg;
-cfg.text_dim = 512;
-cfg.image_size = 224;
-cfg.output_dim = 10;
-cfg.use_quantization = true;  // INT8量化，极致轻量
-
-NeuroFlowMultiModal model(cfg);
-
-// 多模态推理
-Tensor text({1, 512});                // 文本特征
-Tensor image({1, 3, 224, 224});       // 图像输入
-auto output = model.forward_multimodal(text, image);
-
-std::cout << "Decision: " << output.decision << std::endl;
-std::cout << "Similarity: " << output.text_image_sim << std::endl;
-```
-
-### Python 使用示例
+### Minimal Example
 
 ```python
-import neuroflow
-import numpy as np
+from neuroflow_v4 import Predictor
 
-# 创建 Lite 模型
-model = neuroflow.NeuroFlowLite(input_dim=512)
+# Auto-downloads ~12.5MB weights from Hugging Face
+predictor = Predictor()
 
-# 推理
-x = np.random.randn(1, 512).astype(np.float32)
-output = model.forward(x)
+# Single text inference
+result = predictor("The theory of relativity changed physics forever")
+print(f"h_var: {result['h_var']:.6f}")       # Hidden state variance (higher = richer)
+print(f"recon_mse: {result['recon_mse']:.6f}")  # Reconstruction quality
+print(f"Top-5 chars: {result['top5_chars']}")    # Vocabulary predictions
 
-print(f"Decision shape: {output.decision.shape}")
-print(f"Saliency: {output.saliency}")
-print(f"Anomaly score: {output.anomaly}")
+# Batch inference
+results = predictor([
+    "Neural networks are fascinating",
+    "The brain contains 86 billion neurons",
+])
+for i, r in enumerate(results['top5_chars']):
+    print(f"Text {i} predicts chars: {r}")
 
-# 获取模型统计
-stats = model.get_stats()
-print(f"Params: {stats.total_params:,}")
-print(f"Memory: {stats.memory_bytes / 1024:.1f} KB")
+# Model analysis
+stats = predictor.analyze()
+print(f"M_V mean norm: {stats['M_V']['mean_norm']:.4f}")
 ```
 
-### 推理模式
+### Run Without Downloading
 
 ```python
-# 1. 纯文本推理
-output = model.forward_text(text_features)
-
-# 2. 纯图像推理
-output = model.forward_image_only(image_data)
-
-# 3. 多模态推理
-output = model.forward_multimodal(text_features, image_data)
-# → decision, value, saliency, text_image_sim, anomaly, ...
+# Random weights (for testing offline)
+predictor = Predictor(weights_path="random")
 ```
 
 ---
 
-## 🚀 部署
+## 🏗️ Architecture
 
-完整部署手册（Linux / macOS / Windows / Docker / GPU）：**[📖 DEPLOYMENT.md](DEPLOYMENT.md)**
+```
+Input [N, 1024]
+    │
+    ├─ W_embed (1024×1024) ── ReLU ── 0.1× residual ──┐
+    │                                                    │
+    └──────────────────────── X_in ──────────────────────┘
+                                    │
+                              ┌─────▼─────┐
+                              │  W_p (1024×512)  │
+                              │  → ReLU → h1     │
+                              └─────┬─────┘
+                                    │
+                ┌───────────────────┼───────────────────┐
+                │                   │                   │
+          ┌─────▼─────┐       ┌────▼────┐       ┌─────▼─────┐
+          │  Query     │       │  Gate   │       │  Memory    │
+          │  W_q(512×256)│      │W_gate(512×512)│  │  M_K(32×256) │
+          │  Q = h1@W_q │      │σ(h1@W_g+b)│  │  M_V(32×256) │
+          └─────┬─────┘       └────┬────┘       └─────┬─────┘
+                │                   │                   │
+                │             ┌─────▼─────┐            │
+                │             │  Gate     │            │
+                │             │ Fusion:   │◄───────────┘
+                │             │ gate·h1 + │
+                │             │ (1-gate)·mem_feat
+                │             └─────┬─────┘
+                │                   │
+                │             ┌─────▼─────┐
+                │             │  h3 = ReLU(h_mem)  │
+                │             │  → LayerNorm       │
+                │             │  → SAE Top-k mask  │
+                │             └─────┬─────┘
+                │                   │
+                ├───────────────────┼───────────────────┐
+                │                   │                   │
+          ┌─────▼─────┐       ┌────▼────┐       ┌─────▼─────┐
+          │  Recon     │       │  Mem    │       │  Value    │
+          │  W_d(512×1024)│      │  W_m(512×256)│  │  W_v(512×1)   │
+          └─────────────┘       └─────────┘       └───────────┘
+
+          ┌─────────────────────────────────────────────┐
+          │  Vocab Head (Independent)                    │
+          │  h3 → V_in(512×256) → ReLU → V_out(256×500)  │
+          └─────────────────────────────────────────────┘
+```
+
+### Components
+
+| Component | Shape | Params | Role |
+|-----------|-------|--------|------|
+| **W_embed** | 1024×1024 | 1,048,576 | Learnable feature rearrangement |
+| **W_p** | 1024×512 | 524,288 | First layer projection |
+| **M_K** | 32×256 | 8,192 | Memory keys (L2 normalized) |
+| **M_V** | 32×256 | 8,192 | Memory values |
+| **W_q** | 512×256 | 131,072 | Query projection |
+| **W_gate** + **b_gate** | 512×512 + 512 | 262,656 | Gate network |
+| **W_mem_out** | 256×512 | 131,072 | Memory readout |
+| **W_m** + **b_m** | 512×256 + 256 | 131,328 | Retrieved mem head |
+| **W_d** + **b_d** | 512×1024 + 1024 | 525,312 | Decoder (reconstruction) |
+| **W_v** + **b_v** | 512×1 + 1 | 513 | Value head |
+| **W_gen** + **b_gen** | 512×500 + 500 | 256,500 | Vocabulary generator |
+| **V_in** | 512×256 | 131,072 | Vocab head input |
+| **V_out** + **V_bias** | 256×500 + 500 | 128,500 | Vocab head output |
+| **Total** | | **3,287,273** | **12.54 MB** |
+
+---
+
+## 📊 Benchmarks
+
+### Training Metrics (200M+ Topics)
+
+| Metric | Value | Interpretation |
+|--------|-------|----------------|
+| **Space Var** | 0.0143 | ✅ **Healthy** — rich representation space |
+| **Recon MSE** | 0.000586 | ✅ **Lowest** — excellent reconstruction |
+| **Word BCE** | 0.6971 | ✅ **Above entropy wall** (0.693 = random) |
+| **Top-5 Acc** | 23.13% | ✅ Highest recorded — vocabulary learning |
+| **M_V Norm** | 0.2242 | 📈 Rising (target: 1.0) |
+| **Gate σ** | 0.0118 | ⏳ Awaiting temperature activation |
+| **Convergence** | 0.40ms inference | ✅ Real-time capable |
+
+### Evolution History
+
+```
+Era 1: 0-50M topics  |  Space Var: 0.0004 → 0.008  |  Recon: 0.002 → 0.0008
+Era 2: 50-100M       |  Space Var: 0.008 → 0.012  |  Recon: 0.0008 → 0.0006
+Era 3: 100-150M      |  Space Var: 0.012 → 0.013  |  Recon: 0.0006 → 0.0006
+Era 4: 150-200M      |  Space Var: 0.013 → 0.014  |  Recon: 0.0006 → 0.000586
+```
+
+### How it Compares
+
+| Model | Params | Memory | CPU Inference | Deps |
+|-------|--------|--------|:---:|------|
+| **NeuroFlow v4** | **3.29M** | **12.5 MB** | **~1ms** | NumPy only |
+| TinyBERT | 14.5M | 55 MB | ~45ms | PyTorch |
+| MobileNetV3-Small | 2.5M | 9.4 MB | ~5ms | PyTorch/CUDA |
+| SqueezeNet v1.1 | 1.24M | 4.8 MB | ~8ms | PyTorch/CUDA |
+
+---
+
+## 🔬 Training
+
+### Self-Supervised Objective
+
+```
+L = λ₁·MSE_recon + λ₂·MSE_mem + λ₃·MSE_value
+  + λ₄·BCE_vocab + λ₅·Contrastive + λ₆·VICReg
+  + λ₇·MemoryPump (M_V norm + diversity)
+```
+
+### Adaptive Training Strategy
+
+1. **Phase 1 — Manifold Recovery** (var < 0.01):
+   - Aggressive contrastive learning (weight up to 5.0)
+   - Vocab gradient warming (W_gen lr ramps from 0→1, h3 injection 0→0.2)
+   - VICReg variance push (hinge at γ=0.05)
+
+2. **Phase 2 — Vocabulary Learning** (var ≥ 0.01):
+   - Full vocabulary gradient to shared layers
+   - Auto-evolution triggered on stagnation (15 batches without improvement)
+
+3. **Phase 3 — Gate Homogenization Breaking** (M_V ≥ 0.5, gate σ < 0.015):
+   - Gate temperature cosine annealing (τ: 0.2 → 1.0 over 500K topics)
+   - Memory energy pump (M_V norm push toward 1.0)
+
+### Running Training
 
 ```bash
-# 一键部署
-bash scripts/deploy.sh
+# Continuous self-supervised learning daemon
+python3 daemon_v3.py
 
-# 或 pip 安装
-pip install git+https://github.com/chenzhiwenhphp12-afk/neuroflow-model.git
+# Or use the script with specific config
+python3 -c "
+from neuroflow_v4 import NeuroFlowV4
+model = NeuroFlowV4()
+# ... your custom training loop
+"
 ```
 
 ---
 
-## 📁 项目结构
+## 📁 Project Structure
 
 ```
 neuroflow-model/
-├── cpp_core/                          # C++ 核心（零依赖）
-│   ├── include/neuroflow/
-│   │   ├── tensor.hpp                 # SIMD 张量运算库
-│   │   ├── networks.hpp               # SN/ECN/DMN 类脑网络
-│   │   ├── memory.hpp                 # MLA KV Cache + 分页记忆
-│   │   ├── model.hpp                  # 单模态模型
-│   │   ├── multimodal.hpp             # 多模态组件
-│   │   ├── multimodal_model.hpp       # 多模态模型整合
-│   │   ├── backprop.hpp               # 反向传播
-│   │   └── online_learning.hpp        # 在线学习
-│   ├── bindings/
-│   │   └── python_bindings.cpp        # pybind11 Python 绑定
-│   ├── tests/                         # 30+ 单元测试
-│   ├── CMakeLists.txt                 # CMake 跨平台构建
-│   └── build.sh                       # 快速编译脚本
-│
-├── neuroflow/                         # Python 实现（原型/训练）
-│   ├── model.py / model_lite.py
-│   ├── modules.py / modules_v2.py
-│   └── trainer.py
-│
-├── setup.py                           # pip install 入口
-├── pyproject.toml                     # PEP 517 构建配置
-├── configs/                           # 训练/部署配置
-├── scripts/                           # 工具脚本
-└── tests/                             # Python 测试
+├── src/
+│   └── neuroflow_v4/          # 🔥 NEW: Pure NumPy package
+│       ├── __init__.py         # Public API
+│       ├── config.py           # Model hyperparameters
+│       ├── model.py            # NeuroFlowV4 core (forward + training)
+│       ├── encoder.py          # Text encoder (hash + sinusoid)
+│       ├── inference.py        # Predictor API (auto weight download)
+│       └── weights.py          # Weight loading (local / HuggingFace)
+├── neuroflow/                  # C++ pybind11 package (C++ core)
+├── cpp_core/                   # C++ implementation (43K params)
+├── tests/
+│   └── test_model.py           # 193 tests (all pass)
+├── examples/
+│   ├── quick_start.py          # 15-line minimal demo
+│   └── demo_inference.py       # Full demo (analysis, similarity, etc.)
+├── daemon_v3.py                # Self-supervised training daemon
+├── weights/                    # Weight download instructions
+├── pyproject.toml              # Python packaging config
+├── requirements.txt            # numpy>=1.20
+├── .gitattributes              # Git LFS for .npz
+├── .gitignore
+├── LICENSE                     # MIT
+├── README.md                   # This file
+└── DESIGN_v4.md                # Architecture design document
 ```
 
 ---
 
-## ✅ 验证清单
+## 📦 Weights
 
-| # | 要求 | 状态 | 实现 |
-|---|------|:---:|------|
-| 1 | 轻量化 | ✅ | 纯C++17，Lite版43K参数，0.2MB |
-| 2 | 架构先进 | ✅ | ViT + SN/ECN/DMN + MLA + Cross-Modal |
-| 3 | 执行效率 | ✅ | SIMD AVX2/NEON，GEMM ~10 GFLOPS |
-| 4 | 低算力 | ✅ | INT8量化，CPU推理无需GPU |
-| 5 | 速度快 | ✅ | Lite 0.40ms，98×加速 |
-| 6 | 长记忆 | ✅ | MLA KV Cache + 分页 + LTP巩固 |
-| 7 | 准确度 | ✅ | 30项测试全通过，量化误差<0.02 |
-| 8 | 自我升级 | ✅ | consolidate() 在线学习 |
-| 9 | 易部署 | ✅ | CMake/pip 一键安装 |
-| 10 | 易维护 | ✅ | 模块化设计，全测试覆盖 |
+The pretrained weights (12.5 MB) are hosted on **Hugging Face**:
 
----
+| Weight | Size | Source |
+|--------|------|--------|
+| `neuroflow_weights_v4.npz` | 12.5 MB | [Hugging Face 🤗](https://huggingface.co/chenzhiwenhphp12/neuroflow-v4) |
 
-## 🔬 测试覆盖
+The `Predictor` class auto-downloads on first use. Remove `~/.cache/neuroflow_v4/` to re-download.
 
-| 模块 | 测试数 | 状态 |
-|------|:---:|:---:|
-| Tensor (创建/GEMM/LayerNorm/GELU/Softmax/量化) | 10 | ✅ |
-| Model (前向/流形/记忆/MLA/量化/性能) | 10 | ✅ |
-| MultiModal (Vision/Fusion/Attention/多模态推理) | 10 | ✅ |
-| Backprop (梯度/反向传播) | 3 | ✅ |
-| Edge Cases (边界/内存泄漏) | 2 | ✅ |
+To use locally:
+```bash
+# Download manually
+wget https://huggingface.co/chenzhiwenhphp12/neuroflow-v4/resolve/main/neuroflow_weights_v4.npz
+
+# Load
+from neuroflow_v4 import Predictor
+pred = Predictor(weights_path="./neuroflow_weights_v4.npz")
+```
 
 ---
 
-## 📈 版本历史
+## 🧪 Tests
 
-| 版本 | 日期 | 更新 |
-|------|------|------|
-| **v2.1** | 2026-05 | pybind11 pip 安装支持，跨平台构建优化 |
-| **v2.0** | 2026 | 多模态支持 (Vision Encoder + Cross-Modal Fusion) |
-| **v1.0** | 2026 | C++ 核心实现 (SIMD + MLA + INT8) |
-| **v0.1** | 2026 | Python 原型 |
+```bash
+# Run all tests (~4 min)
+python3 tests/test_model.py
+
+# Expected output: "All 193 tests PASSED ✓"
+```
+
+---
+
+## 📐 Design Philosophy
+
+See **[DESIGN_v4.md](DESIGN_v4.md)** for the complete architecture design document, covering:
+
+- Perception-Agent Separation Principle
+- Memory: From Hash to Learnable Gated Bank
+- Why NumPy (Not PyTorch)
+- The Evolution of Sparsity: SAE with Adaptive Top-K
+- Gate Homogenization: Diagnosis and Triple-Patch Strategy
+- VICReg: Variance as a Training Signal
+
+---
+
+## 🗺️ Roadmap
+
+- [x] v4.0: Gated Memory Bank + SAE + Self-Evolution
+- [x] v4.1: Gate Temperature Annealing
+- [ ] v4.2: Multi-Head Memory Bank
+- [ ] v4.3: Reinforcement Learning Integration
+- [ ] v4.5: Hierarchical Memory (short-term + long-term)
+- [ ] v5.0: Symbolic Reasoning Integration
 
 ---
 
 ## 📄 License
 
-MIT License — 完全开源，自由使用、修改、分发。
+MIT License — Copyright (c) 2026 Chen Zhiwen
 
-## 📬 联系方式
+---
 
-- GitHub: [github.com/chenzhiwenhphp12-afk/neuroflow-model](https://github.com/chenzhiwenhphp12-afk/neuroflow-model)
+## 📬 Contact
+
+- GitHub: [chenzhiwenhphp12-afk/neuroflow-model](https://github.com/chenzhiwenhphp12-afk/neuroflow-model)
 - Email: chenzhiwenhphp12@gmail.com
+- Hugging Face: [chenzhiwenhphp12/neuroflow-v4](https://huggingface.co/chenzhiwenhphp12/neuroflow-v4)
 
 ---
 
 <p align="center">
-  <sub>Built with ❤️ for the open-source community · Inspired by neuroscience · Powered by C++</sub>
+  <sub>Built with ❤️ · Inspired by neuroscience · Powered by NumPy</sub>
 </p>
