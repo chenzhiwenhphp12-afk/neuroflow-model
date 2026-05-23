@@ -4,7 +4,7 @@ NeuroFlow v4 — 推理 API
 零外部依赖的推理接口。
 
 自动处理:
-  - 权重下载 (Hugging Face / 本地)
+  - 权重下载 (GitHub Release / 本地)
   - 文本编码
   - 完整前向传播
   - 词汇预测

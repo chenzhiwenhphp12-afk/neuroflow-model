@@ -62,12 +62,12 @@ def find_local_weights(search_paths: Optional[list] = None) -> Optional[str]:
     return None
 
 
-def download_from_huggingface(url: Optional[str] = None,
-                              cache_dir: Optional[str] = None) -> str:
-    """从 Hugging Face 下载权重文件
+def download_from_github(url: Optional[str] = None,
+                          cache_dir: Optional[str] = None) -> str:
+    """从 GitHub Release 下载权重文件
     
     Args:
-        url: 下载 URL (默认使用 config 中的 HF_WEIGHT_URL)
+        url: 下载 URL (默认使用 config 中的 GITHUB_WEIGHT_URL)
         cache_dir: 缓存目录
     
     Returns:
@@ -76,7 +76,7 @@ def download_from_huggingface(url: Optional[str] = None,
     import urllib.request
     
     if url is None:
-        url = C.HF_WEIGHT_URL
+        url = C.GITHUB_WEIGHT_URL
     if cache_dir is None:
         cache_dir = get_default_cache_dir()
     
@@ -85,7 +85,7 @@ def download_from_huggingface(url: Optional[str] = None,
     if os.path.exists(dest):
         return dest
     
-    print(f"📥 正在从 Hugging Face 下载模型权重...")
+    print(f"📥 正在从 GitHub Release 下载模型权重...")
     print(f"   URL: {url}")
     print(f"   到: {dest}")
     
@@ -107,11 +107,11 @@ def download_from_huggingface(url: Optional[str] = None,
 
 def load_pretrained(local_path: Optional[str] = None,
                     auto_download: bool = True) -> Dict[str, np.ndarray]:
-    """加载预训练权重 (自动查找本地 → 自动下载 HF)
+    """加载预训练权重 (自动查找本地 → 自动下载 GitHub Release)
     
     Args:
         local_path: 本地路径, 或 None 自动查找
-        auto_download: 本地找不到时是否自动从 Hugging Face 下载
+        auto_download: 本地找不到时是否自动从 GitHub Release 下载
     
     Returns:
         权重字典
@@ -124,12 +124,12 @@ def load_pretrained(local_path: Optional[str] = None,
         return load_weights_from_npz(local_path)
     
     if auto_download:
-        print(f"📂 本地未找到权重, 尝试从 Hugging Face 下载...")
-        local_path = download_from_huggingface()
+        print(f"📂 本地未找到权重, 尝试从 GitHub Release 下载...")
+        local_path = download_from_github()
         return load_weights_from_npz(local_path)
     
     raise FileNotFoundError(
         f"未找到权重文件。\n"
-        f"请从 {C.HF_WEIGHT_URL} 下载\n"
+        f"请从 {C.GITHUB_WEIGHT_URL} 下载\n"
         f"或使用本地路径: {find_local_weights(search_paths=[]) or '.'}"
     )

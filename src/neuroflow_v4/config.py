@@ -52,9 +52,11 @@ VOCAB_START_VAR_THRESHOLD = 0.1   # 启动热身的 var 阈值
 
 # ── 权重文件 ──
 WEIGHT_FILENAME = "neuroflow_weights_v4.npz"
-# Hugging Face 权重下载链接
-HF_REPO = "chenzhiwenhphp12/neuroflow-v4"
-HF_WEIGHT_URL = f"https://huggingface.co/{HF_REPO}/resolve/main/{WEIGHT_FILENAME}"
+
+# GitHub Release 下载链接（GFW 友好，国内可直接访问）
+GITHUB_REPO = "chenzhiwenhphp12-afk/neuroflow-model"
+GITHUB_RELEASE_TAG = "v4.0.0"
+GITHUB_WEIGHT_URL = f"https://github.com/{GITHUB_REPO}/releases/download/{GITHUB_RELEASE_TAG}/{WEIGHT_FILENAME}"
 
 # ── 架构元信息 ──
 ARCHITECTURE = {
