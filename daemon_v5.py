@@ -22,6 +22,8 @@ SAVE_EVERY = 16000
 STATUS_INTERVAL = 1800
 
 from ops_v5 import *
+from ops_v5 import (AdaptivePositionBlender, EvolutionMonitorV5, 
+                    diagnose_temporal_variance)
 from tokenizer_v5 import get_tokenizer, PAD_ID
 
 os.makedirs(KB_DIR, exist_ok=True)
@@ -93,6 +95,11 @@ class NeuroFlowV5Daemon:
         self.epoch = 0
         self._h_global = np.zeros((1, D_MEM), dtype=np.float32)
         self.pe_table = get_pe_table(MAX_SEQ_LEN, D_MODEL)  # 预计算PE表
+        self.pos_blender = AdaptivePositionBlender(D_MODEL, MAX_SEQ_LEN, warmup_steps=1000)
+        self.evo_monitor = EvolutionMonitorV5(VOCAB_SIZE, var_target=0.0356)
+        self.train_step_counter = 0
+        self._recent_losses = deque(maxlen=50)
+        self._recent_vars = deque(maxlen=50)
         self._init_model()
         self._load_state()
         self._preload_kb()
@@ -196,10 +203,16 @@ class NeuroFlowV5Daemon:
         return text
 
     def forward(self, token_ids):
-        """前向传播"""
+        """前向传播（含自适应PE淡入 + 时序方差诊断）"""
         N, L = token_ids.shape
         X_embed = self.W_embed[token_ids]  # (N, L, D)
-        X = X_embed + self.pe_table[:L][np.newaxis, :, :]
+        
+        # Adaptive PE blending per sample (avoid spatial bullying)
+        X_list = []
+        for i in range(N):
+            X_i, lambda_t = self.pos_blender.blend(X_embed[i], self.train_step_counter)
+            X_list.append(X_i)
+        X = np.stack(X_list, axis=0)
 
         C = np.zeros_like(X)
         for i in range(N):
@@ -262,7 +275,10 @@ class NeuroFlowV5Daemon:
 
         self.n_updates += 1
         self.total_loss += loss
-        return loss, h_var
+        self.train_step_counter += 1
+        self._recent_losses.append(loss)
+        self._recent_vars.append(h_var)
+        return loss, h_var, logits, h
 
     def run(self):
         """主循环"""
@@ -274,16 +290,26 @@ class NeuroFlowV5Daemon:
         while True:
             try:
                 texts = [self._get_next_text() for _ in range(BATCH_SIZE)]
-                loss, h_var = self.train_step(texts)
+                loss, h_var, logits, h = self.train_step(texts)
                 self.state["topics"] += len(texts)
                 batch_count += 1
 
                 # Evolution
                 if self.state["topics"] % EVOLVE_INTERVAL < BATCH_SIZE and self.state["topics"] > 0:
-                    fit = max(0, 1.0 - loss / 15.0)
-                    self.state["fitness"] = fit
+                    # v5.0 fitness: Root-RIG + PRR + Recon + Var
+                    recent_loss = np.mean(self._recent_losses) if self._recent_losses else loss
+                    recent_var = np.mean(self._recent_vars) if self._recent_vars else h_var
+                    fit_val, evo_metrics = self.evo_monitor.evaluate(
+                        recon_loss=loss,  # CE loss serves as recon proxy
+                        vocab_loss=recent_loss,
+                        current_var=recent_var
+                    )
+                    self.state["fitness"] = fit_val
                     self.state["evolutions"] += 1
-                    print(f"  🧬 进化 #{self.state['evolutions']}: fit={fit:.4f} loss={loss:.4f} batch={batch_count}", flush=True)
+                    print(f"  🧬 进化 #{self.state['evolutions']}: "
+                          f"fit={fit_val:.4f} (rig={evo_metrics['root_rig']:.3f} "
+                          f"prr={evo_metrics['prr']:.3f}) "
+                          f"loss={loss:.4f} batch={batch_count}", flush=True)
 
                 # Save
                 if self.state["topics"] % SAVE_EVERY < BATCH_SIZE:
@@ -294,8 +320,12 @@ class NeuroFlowV5Daemon:
                 if batch_count % 10 == 0:
                     bar_len = min(30, int(self.state["fitness"] * 30))
                     bar = "\u2588" * bar_len + "\u2591" * (30 - bar_len)
+                    # LVR诊断
+                    lvr, v_spec = diagnose_temporal_variance(h.reshape(-1, 128, D_MODEL)) if h.size >= 128 else (0, [])
+                    lambda_t = self.pos_blender.blend(self.W_embed[:1], self.train_step_counter)[1]
                     print(f"  [{self.state['topics']:7d}] 📦 batch#{batch_count} e{self.epoch} "
-                          f"loss={loss:.4f} var={h_var:.4f} fit={self.state['fitness']} | {bar}", flush=True)
+                          f"loss={loss:.4f} var={h_var:.4f} λ={lambda_t:.2f} "
+                          f"lvr={lvr:.3f} fit={self.state['fitness']:.4f} | {bar}", flush=True)
 
                 # Status
                 now = time.time()

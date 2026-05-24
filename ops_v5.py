@@ -8,6 +8,69 @@ NeuroFlow v5.0 核心算子
 """
 import numpy as np
 
+
+class AdaptivePositionBlender:
+    """余弦淡入位置编码混合器 — 防止PE空间霸凌BPE语义"""
+    def __init__(self, d_model=512, max_len=8000, warmup_steps=1000):
+        self.d_model = d_model
+        self.warmup_steps = warmup_steps
+        self.embed_scale = np.sqrt(d_model)
+        self.PE_table = self._precompute(max_len, d_model)
+    
+    def _precompute(self, max_len, d_model):
+        pe = np.zeros((max_len, d_model))
+        pos = np.arange(max_len)[:, np.newaxis]
+        div = np.exp(np.arange(0, d_model, 2) * -(np.log(10000.0) / d_model))
+        pe[:, 0::2] = np.sin(pos * div)
+        pe[:, 1::2] = np.cos(pos * div)
+        return pe  # (max_len, d_model)
+    
+    def blend(self, X_embed, current_step):
+        """X_embed: (L, D) → 混合位置觉醒后的张量 (L, D)"""
+        L, D = X_embed.shape
+        lambda_t = 0.5 * (1.0 - np.cos(np.pi * current_step / self.warmup_steps)) if current_step < self.warmup_steps else 1.0
+        X_scaled = X_embed * self.embed_scale
+        X_hybrid = X_scaled + (lambda_t * self.PE_table[:L, :])
+        return X_hybrid, lambda_t
+
+
+class EvolutionMonitorV5:
+    """高灵敏度自适应Fitness — Root-RIG + PRR双轨"""
+    def __init__(self, vocab_size=5000, var_target=0.0356):
+        self.V = vocab_size
+        self.loss_baseline = np.log(self.V)  # ln(5000) ≈ 8.5172
+        self.var_target = var_target
+    
+    def evaluate(self, recon_loss, vocab_loss, current_var, w_recon=0.4, w_vocab=0.5, w_var=0.1):
+        delta_loss = max(0.0, self.loss_baseline - vocab_loss)
+        root_rig = np.sqrt(delta_loss / self.loss_baseline) if self.loss_baseline > 0 else 0.0
+        current_ppl = np.exp(np.clip(vocab_loss, 0.0, self.loss_baseline))
+        prr = 1.0 - (current_ppl / self.V)
+        s_vocab = 0.7 * root_rig + 0.3 * prr
+        s_recon = np.exp(-100.0 * recon_loss) if recon_loss > 0 else 1.0
+        s_var = np.clip(current_var / self.var_target, 0.0, 1.0)
+        total = (w_recon * s_recon) + (w_vocab * s_vocab) + (w_var * s_var)
+        return float(total), {"root_rig": float(root_rig), "prr": float(prr), "s_vocab": float(s_vocab)}
+
+
+def diagnose_temporal_variance(H_layer, num_chunks=8):
+    """时序断层方差谱 — 检测长尾语义湮灭(LVR)
+    输入: H_layer (B, L, D) 或 (L, D)
+    返回: lvr, v_spectrum
+    """
+    if len(H_layer.shape) == 3:
+        H_seq = H_layer[0]
+    else:
+        H_seq = H_layer
+    L, D = H_seq.shape
+    chunk_size = L // num_chunks
+    v_spectrum = []
+    for k in range(num_chunks):
+        chunk = H_seq[k * chunk_size:(k + 1) * chunk_size, :]
+        v_spectrum.append(float(np.mean(np.var(chunk, axis=1))))
+    lvr = v_spectrum[-1] / (v_spectrum[0] + 1e-8)
+    return lvr, v_spectrum
+
 # ── 配置 ──
 VOCAB_SIZE = 5000
 D_MODEL = 512          # 隐藏维度
