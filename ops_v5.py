@@ -227,3 +227,98 @@ if __name__ == "__main__":
     print(f"CE Loss: {loss:.4f}, grad: {grad.shape}")
     
     print("All v5.0 operators OK ✅")
+
+
+# ═══════════════════════════════════════════════════
+# v5.1: 幂律时序阻尼记忆库 (PTD-MC) + IGR梯度重缩放
+# ═══════════════════════════════════════════════════
+
+class DampedGatedMemoryBankV5WithIGR:
+    """幂律时序阻尼记忆 + 隐式梯度重缩放
+    
+    前向: 擦除门随时间对数幂律衰减 (alpha控制陡度)
+    反向: IGR因子抵消前向阻尼，防止长尾梯度饥饿
+    
+    LVR联动: LVR<0.15 → alpha+=0.05 | LVR>2.5 → alpha-=0.03
+    """
+    def __init__(self, mem_dim=256, base_alpha=0.85, noise_theta=2.5):
+        self.mem_dim = mem_dim
+        self.alpha = base_alpha      # 幂律指数 (自进化可调)
+        self.theta = noise_theta     # 防噪天花板
+        self.M = np.zeros((mem_dim, mem_dim))
+        self.cache = {}
+    
+    def reset(self):
+        self.M.fill(0.0)
+        self.cache = {}
+    
+    def forward(self, U, V, G_erase, G_write):
+        """全序列前向: 幂律阻尼擦除 + 外积写入
+        
+        U: (L, D_mem)  写入特征
+        V: (L, D_mem)  写入路由
+        G_erase: (L, D_mem)  擦除门 (0~1)
+        G_write: (L, D_mem)  写入门 (0~1)
+        返回: H_out (L, D_mem)
+        """
+        L, D = U.shape
+        H_out = np.zeros((L, D))
+        t_idx = np.arange(L)
+        
+        # 幂律阻尼谱线: 1/ln(e+t)^alpha
+        damp = (1.0 / (np.log(np.e + t_idx) ** self.alpha))[:, np.newaxis]
+        G_damped = G_erase * damp  # (L, D)
+        
+        M_hist = []
+        for t in range(L):
+            M_hist.append(self.M.copy())
+            u = U[t, :, np.newaxis]   # (D, 1)
+            v = V[t, :, np.newaxis]   # (D, 1)
+            
+            self.M = (self.M * (1.0 - G_damped[t, :, np.newaxis]) 
+                      + G_write[t, :, np.newaxis] * (u @ v.T))
+            H_out[t] = np.squeeze(self.M @ u)
+        
+        self.cache = {"U": U, "V": V, "G_erase": G_erase, "G_write": G_write,
+                      "G_damped": G_damped, "damp": damp, "M_hist": M_hist, "L": L}
+        return H_out
+    
+    def backward(self, dH_out):
+        """反向传播: IGR隐式梯度重缩放
+        
+        dH_out: (L, D_mem) 上游梯度
+        """
+        U = self.cache["U"]; V = self.cache["V"]
+        Ge = self.cache["G_erase"]; Gw = self.cache["G_write"]
+        Gd = self.cache["G_damped"]; damp = self.cache["damp"]
+        Mh = self.cache["M_hist"]; L = self.cache["L"]
+        D = self.mem_dim
+        
+        dU = np.zeros_like(U); dV = np.zeros_like(V)
+        dGe = np.zeros_like(Ge); dGw = np.zeros_like(Gw)
+        dM_next = np.zeros((D, D))
+        
+        for t in reversed(range(L)):
+            u = U[t, :, np.newaxis]; v = V[t, :, np.newaxis]
+            M_prev = Mh[t]
+            
+            # 汇聚梯度
+            dM_cur = dM_next + (dH_out[t, :, np.newaxis] @ u.T)
+            
+            # 写入门梯度
+            dU[t] += np.squeeze(dM_cur @ v * Gw[t, :, np.newaxis])
+            dV[t] += np.squeeze(dM_cur.T @ u * Gw[t, :, np.newaxis])
+            dGw[t] = np.squeeze(dM_cur @ (u @ v.T)) * Gw[t] * (1.0 - Gw[t])
+            
+            # 擦除门梯度 + IGR重缩放
+            d_erase_raw = -np.squeeze(dM_cur @ M_prev) * damp[t]
+            grad_norm = np.sqrt(np.sum(d_erase_raw ** 2) + 1e-8)
+            w_t = 1.0 / (damp[t, 0] + 1e-8)
+            w_safe = min(w_t, 1.0 + self.theta / grad_norm)
+            dGe[t] = d_erase_raw * w_safe * Ge[t] * (1.0 - Ge[t])
+            
+            # 回传记忆梯度
+            dM_next = dM_cur * (1.0 - Gd[t, :, np.newaxis])
+            dU[t] += np.squeeze(Mh[t].T @ dH_out[t, :, np.newaxis])
+        
+        return dU, dV, dGe, dGw

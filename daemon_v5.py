@@ -23,7 +23,7 @@ STATUS_INTERVAL = 1800
 
 from ops_v5 import *
 from ops_v5 import (AdaptivePositionBlender, EvolutionMonitorV5, 
-                    diagnose_temporal_variance)
+                    diagnose_temporal_variance, DampedGatedMemoryBankV5WithIGR)
 from tokenizer_v5 import get_tokenizer, PAD_ID
 
 os.makedirs(KB_DIR, exist_ok=True)
@@ -97,6 +97,7 @@ class NeuroFlowV5Daemon:
         self.pe_table = get_pe_table(MAX_SEQ_LEN, D_MODEL)  # 预计算PE表
         self.pos_blender = AdaptivePositionBlender(D_MODEL, MAX_SEQ_LEN, warmup_steps=1000)
         self.evo_monitor = EvolutionMonitorV5(VOCAB_SIZE, var_target=0.0356)
+        self.mem_bank = DampedGatedMemoryBankV5WithIGR(mem_dim=D_MEM, base_alpha=0.85)
         self.train_step_counter = 0
         self._recent_losses = deque(maxlen=50)
         self._recent_vars = deque(maxlen=50)
@@ -306,6 +307,17 @@ class NeuroFlowV5Daemon:
                     )
                     self.state["fitness"] = fit_val
                     self.state["evolutions"] += 1
+                    
+                    # LVR自进化反馈: 动态调整记忆阻尼alpha
+                    if hasattr(self, 'mem_bank') and h.size >= 128:
+                        lvr, v_spec = diagnose_temporal_variance(h.reshape(-1, 128, D_MODEL))
+                        if lvr < 0.15:
+                            self.mem_bank.alpha = min(2.0, self.mem_bank.alpha + 0.05)
+                            print(f"    ⚠️ LVR={lvr:.3f}<0.15 时序湮灭 → alpha={self.mem_bank.alpha:.2f}", flush=True)
+                        elif lvr > 2.5:
+                            self.mem_bank.alpha = max(0.2, self.mem_bank.alpha - 0.03)
+                            print(f"    📢 LVR={lvr:.3f}>2.5 时序发散 → alpha={self.mem_bank.alpha:.2f}", flush=True)
+                    
                     print(f"  🧬 进化 #{self.state['evolutions']}: "
                           f"fit={fit_val:.4f} (rig={evo_metrics['root_rig']:.3f} "
                           f"prr={evo_metrics['prr']:.3f}) "
