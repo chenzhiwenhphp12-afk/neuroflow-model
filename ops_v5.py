@@ -138,23 +138,39 @@ def causal_window_gating_operator(X, W_g, b_g, window_size=WINDOW_SIZE, gamma=GA
     return C_temporal * Gate
 
 
-def memory_read_write(c, M_Bank, W_read, W_write, W_to_mem):
+def memory_read_write(c, M_Bank, W_read, W_write, W_to_mem, 
+                       position=None, max_pos=8000, alpha=0.85, damping_strength=0.7):
     """低秩记忆读写 (外积擦写, 无Attention)
     
     输入:
       c: (1, D) 当前Token凝聚特征
       M_Bank: (B, D_mem) 记忆槽矩阵
+      position: int 当前token在序列中的绝对位置 (用于时序阻尼)
+      max_pos: int 最大序列长度
+      alpha: float 幂律阻尼指数 (PTD-MC)
+      damping_strength: float 阻尼强度系数
     输出:
-      output: (1, D) 融合记忆后的特征
+      output: (1, D_mem) 融合记忆后的特征
+      M_Bank_new: (B, D_mem) 更新后的记忆槽
     """
     # 1. 路由概率
     r_slot = sigmoid(c @ W_read)    # (1, B)
     w_slot = sigmoid(c @ W_write)   # (1, B)
     
-    # 2. 低秩读取
+    # 2. 时序阻尼 (PTD-MC): 位置越靠后, 擦除门被压得越低
+    if position is not None and max_pos > 0:
+        ratio = position / max_pos
+        # 阻尼因子: 1 - damping_strength * sigmoid(8*(ratio-0.5))
+        # 超过50%位置后, 擦除门开始急剧关闭
+        damp = 1.0 - damping_strength * (1.0 / (1.0 + np.exp(-8.0 * (ratio - 0.5))))
+        # 对数幂律衰减乘数 (与DampedGatedMemoryBank一致)
+        log_damp = 1.0 / (np.log(np.e + position) ** alpha)
+        w_slot = w_slot * damp * log_damp
+    
+    # 3. 低秩读取
     mem_context = r_slot @ M_Bank    # (1, D_mem)
     
-    # 3. 低秩擦写 (增量更新)
+    # 4. 低秩擦写 (增量更新)
     c_proj = c @ W_to_mem           # (1, D_mem)
     delta = w_slot.T @ c_proj        # (B, D_mem)
     M_Bank_new = (1.0 - w_slot.T) * M_Bank + delta
