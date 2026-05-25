@@ -21,7 +21,14 @@ class MiniBPE:
         self.vocab_size = vocab_size
         self.token_to_id = {}
         self.id_to_token = {}
+        self._enc = None  # lazy tiktoken encoder cache
         self._load_or_create()
+    
+    def _get_enc(self):
+        if self._enc is None:
+            import tiktoken
+            self._enc = tiktoken.get_encoding("cl100k_base")
+        return self._enc
     
     def _load_or_create(self):
         """Load existing tokenizer or create from tiktoken"""
@@ -76,10 +83,7 @@ class MiniBPE:
     
     def encode(self, text, max_len=MAX_SEQ_LEN):
         """Encode text → token IDs array of length max_len"""
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        
-        # Use tiktoken for encoding
+        enc = self._get_enc()
         raw_ids = enc.encode(text)[:max_len - 2]  # reserve for <BOS> <EOS>
         
         # Clip to vocab range

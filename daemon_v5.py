@@ -15,8 +15,8 @@ WEIGHTS_FILE = "/home/administrator/.hermes/neuroflow_v5_weights.npz"
 KB_DIR = os.path.join(DEPLOY_PATH, "knowledge_base")
 VOCAB_FILE = os.path.join(DEPLOY_PATH, "tokenizer_v5.json")
 
-BATCH_SIZE = 400
-MAX_SEQ_LEN = 128        # 每个样本最多128 tokens
+BATCH_SIZE = 50            # v5.0: 每batch 50条序列(每条128 tokens), 避免OOM
+MAX_SEQ_LEN = 128          # 训练序列长度 (PE表支持8000, 训练用128避免OOM)
 EVOLVE_INTERVAL = 16000
 SAVE_EVERY = 16000
 STATUS_INTERVAL = 1800
@@ -25,6 +25,10 @@ from ops_v5 import *
 from ops_v5 import (AdaptivePositionBlender, EvolutionMonitorV5, 
                     diagnose_temporal_variance, DampedGatedMemoryBankV5WithIGR)
 from tokenizer_v5 import get_tokenizer, PAD_ID
+
+# 必须放在ops_v5 import之后, 覆盖ops_v5的MAX_SEQ_LEN=8000
+TRAIN_SEQ_LEN = MAX_SEQ_LEN  # ops_v5的8000用作PE表上限
+MAX_SEQ_LEN = 128            # 训练用128, 避免OOM
 
 os.makedirs(KB_DIR, exist_ok=True)
 os.environ.setdefault("OMP_NUM_THREADS", "40")
@@ -208,16 +212,15 @@ class NeuroFlowV5Daemon:
         N, L = token_ids.shape
         X_embed = self.W_embed[token_ids]  # (N, L, D)
         
-        # Adaptive PE blending per sample (avoid spatial bullying)
-        X_list = []
-        for i in range(N):
-            X_i, lambda_t = self.pos_blender.blend(X_embed[i], self.train_step_counter)
-            X_list.append(X_i)
-        X = np.stack(X_list, axis=0)
-
-        C = np.zeros_like(X)
-        for i in range(N):
-            C[i] = causal_window_gating_operator(X[i], self.W_g, self.b_g)
+        # Vectorized PE blending: same lambda for all samples in batch
+        _, lambda_t = self.pos_blender.blend(X_embed[0], self.train_step_counter)
+        # Apply blend to all samples at once
+        X = X_embed * self.pos_blender.embed_scale + lambda_t * self.pos_blender.PE_table[:L]
+        
+        # Vectorized causal window: reshape (N*L, D) and process together
+        h_flat = X.reshape(-1, D_MODEL)
+        C_flat = causal_window_gating_operator(h_flat, self.W_g, self.b_g)
+        C = C_flat.reshape(N, L, D_MODEL)
 
         h = C.reshape(-1, D_MODEL)
         h_abs = np.abs(h)
