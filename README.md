@@ -267,7 +267,6 @@ neuroflow-model/
 
 ---
 
-## 🗺️ Roadmap
 
 - [x] **v4.0**: Gated Memory Bank + SAE + Self-Evolution
 - [x] **v4.1**: Gate Temperature Annealing
