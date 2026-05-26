@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>NeuroFlow v5.3 Architecture</title></head>
+<body style="margin:0;background:#0f172a;display:flex;justify-content:center;align-items:center;min-height:100vh;font-family:'JetBrains Mono',monospace">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 750" width="1100" height="750">
+  <defs>
+    <linearGradient id="bg-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#020617;stop-opacity:1"/>
+      <stop offset="100%" style="stop-color:#0f172a;stop-opacity:1"/>
+    </linearGradient>
+    <linearGradient id="cyan-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#22d3ee;stop-opacity:0.15"/>
+      <stop offset="100%" style="stop-color:#22d3ee;stop-opacity:0.05"/>
+    </linearGradient>
+    <linearGradient id="emerald-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#34d399;stop-opacity:0.15"/>
+      <stop offset="100%" style="stop-color:#34d399;stop-opacity:0.05"/>
+    </linearGradient>
+    <linearGradient id="violet-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#a78bfa;stop-opacity:0.15"/>
+      <stop offset="100%" style="stop-color:#a78bfa;stop-opacity:0.05"/>
+    </linearGradient>
+    <linearGradient id="amber-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#fbbf24;stop-opacity:0.15"/>
+      <stop offset="100%" style="stop-color:#fbbf24;stop-opacity:0.05"/>
+    </linearGradient>
+    <marker id="arrow-cyan" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10" fill="#22d3ee" opacity="0.8"/>
+    </marker>
+    <marker id="arrow-emerald" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10" fill="#34d399" opacity="0.8"/>
+    </marker>
+    <marker id="arrow-violet" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10" fill="#a78bfa" opacity="0.8"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0,0 L10,5 L0,10" fill="#fbbf24" opacity="0.8"/>
+    </marker>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse">
+      <path d="M 30 0 L 0 0 0 30" fill="none" stroke="#1e293b" stroke-width="0.3"/>
+    </pattern>
+  </defs>
+  <!-- Background -->
+  <rect width="1100" height="750" fill="url(#bg-grad)"/>
+  <rect width="1100" height="750" fill="url(#grid)"/>
+  
+  <!-- Title -->
+  <text x="550" y="40" fill="#e2e8f0" font-size="18" font-weight="bold" text-anchor="middle" letter-spacing="2">🧠 NeuroFlow v5.3 Architecture</text>
+  <text x="550" y="58" fill="#94a3b8" font-size="11" text-anchor="middle">Brain-Inspired Neural Network — AdaptiveSAE + DeepSAEStack + IterativeMemory</text>
+
+  <!-- Section labels -->
+  <text x="160" y="90" fill="#22d3ee" font-size="10" text-anchor="middle" font-weight="bold">1️⃣ INPUT</text>
+  <text x="400" y="90" fill="#34d399" font-size="10" text-anchor="middle" font-weight="bold">2️⃣ FEATURE EXTRACTION</text>
+  <text x="640" y="90" fill="#a78bfa" font-size="10" text-anchor="middle" font-weight="bold">3️⃣ MEMORY &amp; ATTENTION</text>
+  <text x="880" y="90" fill="#fbbf24" font-size="10" text-anchor="middle" font-weight="bold">4️⃣ OUTPUT</text>
+
+  <!-- ============ BOX 1: INPUT ============ -->
+  <rect x="60" y="100" width="200" height="110" rx="8" fill="url(#cyan-grad)" stroke="#22d3ee" stroke-width="1.5"/>
+  <rect x="60" y="100" width="200" height="28" rx="8" fill="#22d3ee" fill-opacity="0.15"/>
+  <text x="160" y="118" fill="#22d3ee" font-size="10" text-anchor="middle" font-weight="bold">INPUT</text>
+  
+  <!-- KB Text -->
+  <rect x="80" y="138" width="160" height="24" rx="4" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <text x="160" y="154" fill="#cbd5e1" font-size="9" text-anchor="middle">📄 Knowledge Base Text</text>
+  
+  <!-- Arrow -->
+  <line x1="160" y1="162" x2="160" y2="178" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrow-cyan)"/>
+  
+  <!-- Tokenizer -->
+  <rect x="80" y="178" width="160" height="24" rx="4" fill="#0f172a" stroke="#22d3ee" stroke-width="1"/>
+  <text x="160" y="194" fill="#67e8f9" font-size="9" text-anchor="middle">BPE Tokenizer (5K vocab)</text>
+
+  <!-- Arrow: input → embed -->
+  <line x1="260" y1="155" x2="315" y2="155" stroke="#22d3ee" stroke-width="1.5" marker-end="url(#arrow-cyan)"/>
+
+  <!-- ============ BOX 2: FEATURE EXTRACTION ============ -->
+  <rect x="320" y="100" width="200" height="290" rx="8" fill="url(#emerald-grad)" stroke="#34d399" stroke-width="1.5"/>
+  <rect x="320" y="100" width="200" height="28" rx="8" fill="#34d399" fill-opacity="0.15"/>
+  <text x="420" y="118" fill="#34d399" font-size="10" text-anchor="middle" font-weight="bold">FEATURE EXTRACTION</text>
+
+  <!-- W_embed -->
+  <rect x="340" y="136" width="160" height="28" rx="4" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="420" y="150" fill="#6ee7b7" font-size="8" text-anchor="middle">W_embed (5K × 512)</text>
+  <text x="420" y="160" fill="#6ee7b7" font-size="7" text-anchor="middle">Token → Embedding</text>
+  
+  <line x1="420" y1="164" x2="420" y2="178" stroke="#34d399" stroke-width="1" marker-end="url(#arrow-emerald)"/>
+  
+  <!-- Position Encoding -->
+  <rect x="340" y="178" width="160" height="24" rx="4" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="420" y="194" fill="#6ee7b7" font-size="8" text-anchor="middle">+ Positional Encoding (sin/cos)</text>
+  
+  <line x1="420" y1="202" x2="420" y2="216" stroke="#34d399" stroke-width="1" marker-end="url(#arrow-emerald)"/>
+  
+  <!-- Causal Window Gate -->
+  <rect x="340" y="216" width="160" height="28" rx="4" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="420" y="230" fill="#6ee7b7" font-size="8" text-anchor="middle">Causal Window (W=8, γ=0.85)</text>
+  <text x="420" y="240" fill="#6ee7b7" font-size="7" text-anchor="middle">Temporal Gating</text>
+  
+  <line x1="420" y1="244" x2="420" y2="258" stroke="#34d399" stroke-width="1" marker-end="url(#arrow-emerald)"/>
+
+  <!-- AdaptiveSAE -->
+  <rect x="340" y="258" width="160" height="28" rx="4" fill="#0f172a" stroke="#f59e0b" stroke-width="1.5" filter="url(#glow)"/>
+  <text x="420" y="272" fill="#fcd34d" font-size="8" text-anchor="middle">AdaptiveSAE ✨</text>
+  <text x="420" y="282" fill="#fcd34d" font-size="7" text-anchor="middle">k=76~90 (entropy-driven)</text>
+
+  <line x1="420" y1="286" x2="420" y2="300" stroke="#34d399" stroke-width="1" marker-end="url(#arrow-emerald)"/>
+
+  <!-- DeepSAEStack -->
+  <rect x="340" y="300" width="160" height="28" rx="4" fill="#0f172a" stroke="#f59e0b" stroke-width="1.5" filter="url(#glow)"/>
+  <text x="420" y="314" fill="#fcd34d" font-size="8" text-anchor="middle">DeepSAEStack ✨</text>
+  <text x="420" y="324" fill="#fcd34d" font-size="7" text-anchor="middle">2-layer SAE + Residual + Fusion</text>
+
+  <line x1="420" y1="328" x2="420" y2="342" stroke="#34d399" stroke-width="1" marker-end="url(#arrow-emerald)"/>
+
+  <!-- Pooling -->
+  <rect x="340" y="342" width="160" height="24" rx="4" fill="#0f172a" stroke="#34d399" stroke-width="1"/>
+  <text x="420" y="358" fill="#6ee7b7" font-size="8" text-anchor="middle">Mean Pooling (N×L → N)</text>
+
+  <!-- Arrow to MEMORY -->
+  <line x1="520" y1="340" x2="565" y2="340" stroke="#34d399" stroke-width="1.5" marker-end="url(#arrow-emerald)"/>
+
+  <!-- ============ BOX 3: MEMORY & ATTENTION ============ -->
+  <rect x="570" y="100" width="200" height="290" rx="8" fill="url(#violet-grad)" stroke="#a78bfa" stroke-width="1.5"/>
+  <rect x="570" y="100" width="200" height="28" rx="8" fill="#a78bfa" fill-opacity="0.15"/>
+  <text x="670" y="118" fill="#a78bfa" font-size="10" text-anchor="middle" font-weight="bold">MEMORY &amp; ATTENTION</text>
+
+  <!-- Read Gate -->
+  <rect x="590" y="136" width="160" height="28" rx="4" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="670" y="150" fill="#c4b5fd" font-size="8" text-anchor="middle">W_read (512×32) — Read Gate</text>
+  <text x="670" y="160" fill="#c4b5fd" font-size="7" text-anchor="middle">Sigmoid routing to slots</text>
+  
+  <line x1="670" y1="164" x2="670" y2="178" stroke="#a78bfa" stroke-width="1" marker-end="url(#arrow-violet)"/>
+
+  <!-- Write Gate -->
+  <rect x="590" y="178" width="160" height="28" rx="4" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="670" y="192" fill="#c4b5fd" font-size="8" text-anchor="middle">W_write (512×32) — Write Gate</text>
+  <text x="670" y="202" fill="#c4b5fd" font-size="7" text-anchor="middle">PTD-MC temporal damping</text>
+  
+  <line x1="670" y1="206" x2="670" y2="220" stroke="#a78bfa" stroke-width="1" marker-end="url(#arrow-violet)"/>
+
+  <!-- Memory Bank -->
+  <rect x="590" y="220" width="160" height="42" rx="6" fill="#0f172a" stroke="#a78bfa" stroke-width="1.5"/>
+  <text x="670" y="236" fill="#c4b5fd" font-size="8" text-anchor="middle">Memory Bank</text>
+  <text x="670" y="248" fill="#a78bfa" font-size="8" text-anchor="middle">M_K (32×256)  M_V (32×256)</text>
+  <text x="670" y="258" fill="#a78bfa" font-size="7" text-anchor="middle">Associative read/write</text>
+  
+  <line x1="670" y1="262" x2="670" y2="276" stroke="#a78bfa" stroke-width="1" marker-end="url(#arrow-violet)"/>
+
+  <!-- IterativeMemory -->
+  <rect x="590" y="276" width="160" height="28" rx="4" fill="#0f172a" stroke="#f59e0b" stroke-width="1.5" filter="url(#glow)"/>
+  <text x="670" y="290" fill="#fcd34d" font-size="8" text-anchor="middle">IterativeMemory ✨</text>
+  <text x="670" y="300" fill="#fcd34d" font-size="7" text-anchor="middle">2-iter refine read → confidence</text>
+
+  <line x1="670" y1="304" x2="670" y2="318" stroke="#a78bfa" stroke-width="1" marker-end="url(#arrow-violet)"/>
+
+  <!-- Memory Fusion -->
+  <rect x="590" y="318" width="160" height="24" rx="4" fill="#0f172a" stroke="#a78bfa" stroke-width="1"/>
+  <text x="670" y="334" fill="#c4b5fd" font-size="8" text-anchor="middle">Memory-Feature Fusion</text>
+
+  <!-- Arrow to OUTPUT -->
+  <line x1="770" y1="340" x2="815" y2="340" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-amber)"/>
+
+  <!-- ============ BOX 4: OUTPUT ============ -->
+  <rect x="820" y="100" width="200" height="180" rx="8" fill="url(#amber-grad)" stroke="#fbbf24" stroke-width="1.5"/>
+  <rect x="820" y="100" width="200" height="28" rx="8" fill="#fbbf24" fill-opacity="0.15"/>
+  <text x="920" y="118" fill="#fbbf24" font-size="10" text-anchor="middle" font-weight="bold">OUTPUT</text>
+
+  <!-- W_proj -->
+  <rect x="840" y="136" width="160" height="28" rx="4" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>
+  <text x="920" y="150" fill="#fde68a" font-size="8" text-anchor="middle">W_proj (512×256) + ReLU</text>
+  
+  <line x1="920" y1="164" x2="920" y2="178" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrow-amber)"/>
+
+  <!-- W_out + b_out -->
+  <rect x="840" y="178" width="160" height="28" rx="4" fill="#0f172a" stroke="#fbbf24" stroke-width="1"/>
+  <text x="920" y="192" fill="#fde68a" font-size="8" text-anchor="middle">W_out (256×5K) + b_out (5K)</text>
+  <text x="920" y="202" fill="#fde68a" font-size="7" text-anchor="middle">Logits → Softmax → Next Token</text>
+
+  <line x1="920" y1="206" x2="920" y2="220" stroke="#fbbf24" stroke-width="1" marker-end="url(#arrow-amber)"/>
+
+  <!-- Token Output -->
+  <rect x="860" y="220" width="120" height="28" rx="14" fill="#0f172a" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="920" y="238" fill="#fbbf24" font-size="9" text-anchor="middle" font-weight="bold">🔤 Predicted Token</text>
+
+  <!-- ============ STATS PANEL ============ -->
+  <rect x="60" y="420" width="960" height="180" rx="8" fill="#0f172a" stroke="#334155" stroke-width="1.5"/>
+  <text x="540" y="442" fill="#e2e8f0" font-size="12" font-weight="bold" text-anchor="middle">📊 Model Statistics</text>
+
+  <!-- Stat boxes -->
+  <!-- Row 1 -->
+  <rect x="80" y="455" width="135" height="65" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="147" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">Parameters</text>
+  <text x="147" y="498" fill="#22d3ee" font-size="16" font-weight="bold" text-anchor="middle">4.42M</text>
+  <text x="147" y="512" fill="#64748b" font-size="7" text-anchor="middle">All trainable</text>
+
+  <rect x="225" y="455" width="135" height="65" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="292" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">Weight Size</text>
+  <text x="292" y="498" fill="#34d399" font-size="16" font-weight="bold" text-anchor="middle">18.9 MB</text>
+  <text x="292" y="512" fill="#64748b" font-size="7" text-anchor="middle">Compressed .npz</text>
+
+  <rect x="370" y="455" width="135" height="65" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="437" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">Model Dim</text>
+  <text x="437" y="498" fill="#a78bfa" font-size="16" font-weight="bold" text-anchor="middle">D=512</text>
+  <text x="437" y="512" fill="#64748b" font-size="7" text-anchor="middle">Hidden size</text>
+
+  <rect x="515" y="455" width="135" height="65" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="582" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">Vocabulary</text>
+  <text x="582" y="498" fill="#fbbf24" font-size="16" font-weight="bold" text-anchor="middle">5,000</text>
+  <text x="582" y="512" fill="#64748b" font-size="7" text-anchor="middle">Chinese BPE</text>
+
+  <rect x="660" y="455" width="135" height="65" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="727" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">Memory</text>
+  <text x="727" y="498" fill="#fb7185" font-size="16" font-weight="bold" text-anchor="middle">32×256</text>
+  <text x="727" y="512" fill="#64748b" font-size="7" text-anchor="middle">Slots × Dim</text>
+
+  <rect x="805" y="455" width="195" height="65" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="902" y="475" fill="#94a3b8" font-size="8" text-anchor="middle">Sparsity</text>
+  <text x="902" y="498" fill="#f59e0b" font-size="16" font-weight="bold" text-anchor="middle">k=76~90/512</text>
+  <text x="902" y="512" fill="#64748b" font-size="7" text-anchor="middle">~85% sparse (adaptive)</text>
+
+  <!-- Training info row 2 -->
+  <rect x="80" y="527" width="290" height="60" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="225" y="545" fill="#94a3b8" font-size="8" text-anchor="middle">Training Configuration</text>
+  <text x="225" y="563" fill="#cbd5e1" font-size="8" text-anchor="middle">BS=50 · LR=3.3e-3 cos→1e-3 · 40 CPU threads</text>
+  <text x="225" y="577" fill="#cbd5e1" font-size="8" text-anchor="middle">SEQ=128 · W_embed 3% plateau noise</text>
+
+  <rect x="380" y="527" width="290" height="60" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="525" y="545" fill="#94a3b8" font-size="8" text-anchor="middle">Architecture Upgrades (v5.3)</text>
+  <text x="525" y="563" fill="#fcd34d" font-size="8" text-anchor="middle">✦ AdaptiveSAE: entropy-driven dynamic k</text>
+  <text x="525" y="577" fill="#fcd34d" font-size="8" text-anchor="middle">✦ DeepSAEStack: 2-layer residual SAE · ✦ IterativeMemory: 2-iter refine</text>
+
+  <rect x="680" y="527" width="320" height="60" rx="6" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="840" y="545" fill="#94a3b8" font-size="8" text-anchor="middle">Based On (Research)</text>
+  <text x="840" y="563" fill="#cbd5e1" font-size="7" text-anchor="middle">GatedMemBank (NeuroFlow v4) + DeepSeek Engram (2026)</text>
+  <text x="840" y="577" fill="#cbd5e1" font-size="7" text-anchor="middle">PTD-MC temporal damping · VICReg variance regularization</text>
+
+  <!-- Loss Curve Mini -->
+  <text x="540" y="628" fill="#94a3b8" font-size="9" text-anchor="middle" font-weight="bold">📉 Training Loss Convergence</text>
+  <rect x="340" y="636" width="400" height="90" rx="4" fill="#0f172a" stroke="#334155" stroke-width="1"/>
+  <!-- Simulated loss curve -->
+  <polyline points="360,706 370,700 385,695 400,688 415,682 430,678 445,674 460,670 475,667 490,664 505,661 520,659 535,657 550,655 565,654 580,653 595,652 610,651 625,650 640,650 655,649 670,649 685,648 700,648 715,647 730,647 740,647" 
+    fill="none" stroke="#22d3ee" stroke-width="1.5" opacity="0.8"/>
+  <text x="350" y="720" fill="#64748b" font-size="7">Loss</text>
+  <text x="730" y="720" fill="#64748b" font-size="7">Training Steps →</text>
+  <text x="375" y="642" fill="#22d3ee" font-size="7" opacity="0.7">8.52 (random)</text>
+  <text x="650" y="650" fill="#22d3ee" font-size="7" opacity="0.7">6.0~7.2 (current)</text>
+
+  <!-- Footer -->
+  <text x="550" y="740" fill="#475569" font-size="8" text-anchor="middle">Pure NumPy · Zero GPU · Inspired by neuroscience · MIT License</text>
+</svg>
+</body>
+</html>
