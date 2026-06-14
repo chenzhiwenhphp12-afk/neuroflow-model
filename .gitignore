@@ -39,3 +39,5 @@ data/unified/
 
 # Config local overrides
 configs/*.local*
+llm_train/
+data_test/
