@@ -1,0 +1,16 @@
+{
+  "pad_token": "<pad>",
+  "pad_token_id": 0,
+  "bos_token": "<s>",
+  "bos_token_id": 1,
+  "eos_token": "</s>",
+  "eos_token_id": 2,
+  "unk_token": "<unk>",
+  "unk_token_id": 3,
+  "_comment": {
+    "pad_token": "填充token，用于batch对齐",
+    "bos_token": "序列起始token",
+    "eos_token": "序列结束token，生成时遇到此token停止",
+    "unk_token": "未知token，词表外字符映射到此"
+  }
+}

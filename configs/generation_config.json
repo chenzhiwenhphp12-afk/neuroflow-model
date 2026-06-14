@@ -1,0 +1,22 @@
+{
+  "max_new_tokens": 50,
+  "temperature": 1.0,
+  "top_k": 40,
+  "top_p": 0.9,
+  "repetition_penalty": 1.0,
+  "punct_penalty": 0.0,
+  "random_seed": 0,
+  "strategy": "top_k",
+  "eos_id": 3,
+  "_comment": {
+    "max_new_tokens": "最大生成token数",
+    "temperature": "采样温度(0.0,2.0]",
+    "top_k": "Top-K采样K值",
+    "top_p": "Top-P采样P值[0.0,1.0]",
+    "repetition_penalty": "重复惩罚[1.0,2.0]",
+    "punct_penalty": "标点惩罚",
+    "random_seed": "随机种子(0=随机)",
+    "strategy": "采样策略(greedy/top_k/top_p/top_k_top_p)",
+    "eos_id": "EOS token ID"
+  }
+}

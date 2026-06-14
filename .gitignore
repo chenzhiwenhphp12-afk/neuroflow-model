@@ -1,0 +1,41 @@
+# Build
+build/
+*.o
+*.obj
+*.exe
+neuroflow_train_v2
+neuroflow_train_v2.exe
+
+# Output
+output/
+tok1_data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# IDE
+.arts/
+.codeartsdoer/
+.opencode/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+/tmp/
+*.log
+*.deb
+
+# Data
+data/unified/
+
+# Config local overrides
+configs/*.local*
