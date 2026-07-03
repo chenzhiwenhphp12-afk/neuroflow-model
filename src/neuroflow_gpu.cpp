@@ -62,7 +62,7 @@ __global__ void mask_noise_kernel(float* y, const float* x, const float* mask, i
 // MSE loss gradient: grad = 2*(pred - target)/N
 __global__ void mse_grad_kernel(float* grad, const float* pred, const float* target, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) grad[i] = 2.0f * (pred[i] - target[i]) / (float)n;
+    if (i < n) grad[i] = 2.0f * (pred[i] - target[i]) / static_cast<float>(n);
 }
 
 // SGD update: w -= lr * (grad + wd * w)

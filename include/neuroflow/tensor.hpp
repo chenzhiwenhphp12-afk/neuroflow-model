@@ -12,21 +12,26 @@
  * - INT8/FP8量化支持
  */
 
-#include <vector>
-#include <memory>
-#include <cstring>
-#include <cmath>
-#include <stdexcept>
 #include <algorithm>
-#include <random>
-#include <thread>
-#include <functional>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <random>
+#include <stdexcept>
+#include <thread>
+#include <vector>
 
 #ifdef USE_CBLAS
 extern "C" {
 #include <cblas.h>
 }
+#define cblas_sgemm scipy_cblas_sgemm
+#endif
+
+#ifdef USE_CUDA
+#include "cuda_context.hpp"
 #endif
 
 
@@ -71,9 +76,140 @@ public:
     std::shared_ptr<uint8_t> data_;
     size_t data_size_;
     bool owns_data_;
+
+#ifdef USE_CUDA
+    void* gpu_data_ = nullptr;
+    bool on_gpu_ = false;
+    bool gpu_dirty_ = false;
+
+    void to_gpu() {
+        if (data_size_ == 0 || !data_) return;
+        auto& ctx = CudaContext::instance();
+        if (!ctx.is_available()) return;
+        if (!gpu_data_) {
+            gpu_data_ = ctx.alloc(data_size_);
+        }
+        ctx.copy_h2d(gpu_data_, data_.get(), data_size_);
+        on_gpu_ = true;
+        gpu_dirty_ = false;
+    }
+
+    void to_cpu() {
+        if (!on_gpu_ || !gpu_data_ || data_size_ == 0) return;
+        auto& ctx = CudaContext::instance();
+        if (!ctx.is_available()) return;
+        if (!data_) {
+            data_ = std::shared_ptr<uint8_t>(new uint8_t[data_size_], std::default_delete<uint8_t[]>());
+        }
+        ctx.copy_d2h(data_.get(), gpu_data_, data_size_);
+        ctx.synchronize();
+        gpu_dirty_ = false;
+    }
+
+    float* as_gpu_fp32() {
+        if (dtype_ != QuantType::FP32) throw std::runtime_error("Not FP32 tensor");
+        return reinterpret_cast<float*>(gpu_data_);
+    }
+
+    const float* as_gpu_fp32() const {
+        if (dtype_ != QuantType::FP32) throw std::runtime_error("Not FP32 tensor");
+        return reinterpret_cast<const float*>(gpu_data_);
+    }
+
+    bool is_on_gpu() const { return on_gpu_; }
+
+    void gpu_free() {
+        if (gpu_data_) {
+            auto& ctx = CudaContext::instance();
+            if (ctx.is_available()) ctx.free(gpu_data_);
+            gpu_data_ = nullptr;
+            on_gpu_ = false;
+            gpu_dirty_ = false;
+        }
+    }
+#endif
     
     Tensor() : dtype_(QuantType::FP32), layout_(MemoryLayout::ROW_MAJOR), 
                data_size_(0), owns_data_(true) {}
+
+    ~Tensor() {
+#ifdef USE_CUDA
+        gpu_free();
+#endif
+    }
+
+    Tensor(const Tensor& other)
+        : shape_(other.shape_), strides_(other.strides_), dtype_(other.dtype_),
+          layout_(other.layout_), data_(other.data_), data_size_(other.data_size_),
+          owns_data_(false)
+#ifdef USE_CUDA
+          , gpu_data_(other.gpu_data_), on_gpu_(other.on_gpu_), gpu_dirty_(other.gpu_dirty_)
+#endif
+    {}
+
+    Tensor& operator=(const Tensor& other) {
+        if (this != &other) {
+#ifdef USE_CUDA
+            gpu_free();
+#endif
+            shape_ = other.shape_;
+            strides_ = other.strides_;
+            dtype_ = other.dtype_;
+            layout_ = other.layout_;
+            data_ = other.data_;
+            data_size_ = other.data_size_;
+            owns_data_ = false;
+#ifdef USE_CUDA
+            gpu_data_ = other.gpu_data_;
+            on_gpu_ = other.on_gpu_;
+            gpu_dirty_ = other.gpu_dirty_;
+#endif
+        }
+        return *this;
+    }
+
+    Tensor(Tensor&& other) noexcept
+        : shape_(std::move(other.shape_)), strides_(std::move(other.strides_)),
+          dtype_(other.dtype_), layout_(other.layout_), data_(std::move(other.data_)),
+          data_size_(other.data_size_), owns_data_(other.owns_data_)
+#ifdef USE_CUDA
+          , gpu_data_(other.gpu_data_), on_gpu_(other.on_gpu_), gpu_dirty_(other.gpu_dirty_)
+#endif
+    {
+        other.data_size_ = 0;
+        other.owns_data_ = false;
+#ifdef USE_CUDA
+        other.gpu_data_ = nullptr;
+        other.on_gpu_ = false;
+        other.gpu_dirty_ = false;
+#endif
+    }
+
+    Tensor& operator=(Tensor&& other) noexcept {
+        if (this != &other) {
+#ifdef USE_CUDA
+            gpu_free();
+#endif
+            shape_ = std::move(other.shape_);
+            strides_ = std::move(other.strides_);
+            dtype_ = other.dtype_;
+            layout_ = other.layout_;
+            data_ = std::move(other.data_);
+            data_size_ = other.data_size_;
+            owns_data_ = other.owns_data_;
+#ifdef USE_CUDA
+            gpu_data_ = other.gpu_data_;
+            on_gpu_ = other.on_gpu_;
+            gpu_dirty_ = other.gpu_dirty_;
+            other.gpu_data_ = nullptr;
+            other.on_gpu_ = false;
+            other.gpu_dirty_ = false;
+#endif
+            other.data_size_ = 0;
+            other.owns_data_ = false;
+        }
+        return *this;
+    }
     
     Tensor(const std::vector<size_t>& dims, QuantType type = QuantType::FP32)
         : shape_(dims), dtype_(type), layout_(MemoryLayout::ROW_MAJOR), owns_data_(true) {
@@ -144,6 +280,11 @@ public:
         t.data_ = data_;
         t.data_size_ = data_size_;
         t.owns_data_ = false;
+#ifdef USE_CUDA
+        t.gpu_data_ = gpu_data_;
+        t.on_gpu_ = on_gpu_;
+        t.gpu_dirty_ = gpu_dirty_;
+#endif
         
         size_t total = 1;
         for (auto d : new_shape) total *= d;
@@ -185,21 +326,37 @@ public:
             return;
         }
         
-        auto a = reinterpret_cast<const float*>(A.data_.get());
-        auto b = reinterpret_cast<const float*>(B.data_.get());
-        auto c = reinterpret_cast<float*>(C.data_.get());
-        
         size_t M = transA ? A.shape_[1] : A.shape_[0];
         size_t K = transA ? A.shape_[0] : A.shape_[1];
         size_t N = transB ? B.shape_[0] : B.shape_[1];
+
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && A.is_on_gpu() && B.is_on_gpu()) {
+            const float* d_a = A.as_gpu_fp32();
+            const float* d_b = B.as_gpu_fp32();
+            float* d_c = C.as_gpu_fp32();
+            int lda = static_cast<int>(transA ? M : K);
+            int ldb = static_cast<int>(transB ? K : N);
+            int ldc = static_cast<int>(N);
+            CudaContext::instance().sgemm_rowmajor(transA, transB,
+                static_cast<int>(M), static_cast<int>(N), static_cast<int>(K),
+                alpha, d_a, lda, d_b, ldb, beta, d_c, ldc);
+            C.gpu_dirty_ = true;
+            return;
+        }
+#endif
+
+        auto a = reinterpret_cast<const float*>(A.data_.get());
+        auto b = reinterpret_cast<const float*>(B.data_.get());
+        auto c = reinterpret_cast<float*>(C.data_.get());
 
         #ifdef USE_CBLAS
         CBLAS_TRANSPOSE ctransA = transA ? CblasTrans : CblasNoTrans;
         CBLAS_TRANSPOSE ctransB = transB ? CblasTrans : CblasNoTrans;
         CBLAS_ORDER order = CblasRowMajor;
-        size_t lda = transA ? M : K;
-        size_t ldb = transB ? K : N;
-        cblas_sgemm(order, ctransA, ctransB, M, N, K, alpha, a, lda, b, ldb, beta, c, N);
+        size_t lda_cblas = transA ? M : K;
+        size_t ldb_cblas = transB ? K : N;
+        cblas_sgemm(order, ctransA, ctransB, M, N, K, alpha, a, lda_cblas, b, ldb_cblas, beta, c, N);
         #elif HAS_AVX2
         gemm_avx2(a, b, c, M, K, N, transA, transB, alpha, beta);
         #elif HAS_NEON
@@ -244,7 +401,7 @@ private:
                         bv = _mm256_loadu_ps(&b[k * N + j]);
                     }
                     
-                    sum = _mm256_add_ps(sum, _mm256_mul_ps(_mm256_set1_ps(av), bv));
+                    sum = _mm256_fmadd_ps(_mm256_set1_ps(av), bv, sum);
                 }
                 
                 sum = _mm256_mul_ps(sum, _mm256_set1_ps(alpha));

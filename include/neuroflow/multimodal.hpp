@@ -15,11 +15,11 @@
  * - SN处理多模态显著性分配
  */
 
-#include "tensor.hpp"
-#include "networks.hpp"
-#include <vector>
-#include <memory>
 #include <cmath>
+#include <memory>
+#include <vector>
+#include "networks.hpp"
+#include "tensor.hpp"
 
 namespace neuroflow {
 
@@ -62,9 +62,9 @@ public:
         for (size_t i = 0; i < num_patches; ++i) {
             for (size_t j = 0; j < embed_dim; ++j) {
                 if (j % 2 == 0) {
-                    pe[i * embed_dim + j] = std::sin(i / std::pow(10000, j / (float)embed_dim));
+                    pe[i * embed_dim + j] = std::sin(i / std::pow(10000, j / static_cast<float>(embed_dim)));
                 } else {
-                    pe[i * embed_dim + j] = std::cos(i / std::pow(10000, (j-1) / (float)embed_dim));
+                    pe[i * embed_dim + j] = std::cos(i / std::pow(10000, (j-1) / static_cast<float>(embed_dim)));
                 }
             }
         }

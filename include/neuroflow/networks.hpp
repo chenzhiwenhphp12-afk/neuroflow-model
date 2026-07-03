@@ -9,13 +9,13 @@
  * 3. SalienceNetwork (SN) - 显著性检测
  */
 
-#include "tensor.hpp"
-#include <vector>
-#include <memory>
 #include <cmath>
+#include <memory>
 #include <random>
 #include <thread>
 #include <variant>
+#include <vector>
+#include "tensor.hpp"
 
 namespace neuroflow {
 

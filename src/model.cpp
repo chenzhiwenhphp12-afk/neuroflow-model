@@ -1,10 +1,17 @@
+// 关联头文件
 #include "neuroflow/model.hpp"
-#include "neuroflow/backprop.hpp"
-#include <cmath>
+
+// C++ 标准库
 #include <algorithm>
+#include <cmath>
+
+// 第三方库
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+// 项目头文件
+#include "neuroflow/backprop.hpp"
 
 namespace neuroflow {
 
@@ -150,6 +157,58 @@ Tensor layernorm_backward(const Tensor& input, const Tensor& weight, const Tenso
     return input_grad;
 }
 
+// LayerNorm 参数梯度: 计算 γ (weight) 和 β (bias) 的梯度
+struct LayernormParamGrads {
+    Tensor weight_grad;  // γ gradient, shape [dim]
+    Tensor bias_grad;    // β gradient, shape [dim]
+};
+
+LayernormParamGrads layernorm_param_backward(
+    const Tensor& input, const Tensor& output_grad, float eps = 1e-5f) {
+    size_t batch = input.shape_[0];
+    size_t dim = input.shape_[1];
+
+    LayernormParamGrads result;
+    result.weight_grad = Tensor({dim}, QuantType::FP32);
+    result.bias_grad = Tensor({dim}, QuantType::FP32);
+
+    const float* inp = input.as_fp32();
+    const float* og = output_grad.as_fp32();
+    float* wg = result.weight_grad.as_fp32();
+    float* bg = result.bias_grad.as_fp32();
+
+    // Precompute mean and inv_std for each batch element
+    std::vector<float> means(batch), inv_stds(batch);
+    for (size_t b = 0; b < batch; ++b) {
+        float mean = 0.0f;
+        for (size_t d = 0; d < dim; ++d) mean += inp[b * dim + d];
+        mean /= dim;
+        means[b] = mean;
+        float var = 0.0f;
+        for (size_t d = 0; d < dim; ++d) {
+            float diff = inp[b * dim + d] - mean;
+            var += diff * diff;
+        }
+        var /= dim;
+        inv_stds[b] = 1.0f / std::sqrt(var + eps);
+    }
+
+    // γ_grad[d] = sum_b(output_grad[b,d] * (input[b,d]-mean[b])/std[b]) / batch
+    // β_grad[d] = sum_b(output_grad[b,d]) / batch
+    for (size_t d = 0; d < dim; ++d) {
+        float w_sum = 0.0f, b_sum = 0.0f;
+        for (size_t b = 0; b < batch; ++b) {
+            float normalized = (inp[b * dim + d] - means[b]) * inv_stds[b];
+            w_sum += og[b * dim + d] * normalized;
+            b_sum += og[b * dim + d];
+        }
+        wg[d] = w_sum / batch;
+        bg[d] = b_sum / batch;
+    }
+
+    return result;
+}
+
 }
 
 FullBackpropEngine::FullBackpropEngine(NeuroFlowModel& m) : model(m) {}
@@ -164,6 +223,14 @@ NeuroFlowModel::Output FullBackpropEngine::forward_with_cache(const Tensor& x) {
 
     auto sn_out = model.sn->forward(cache.h);
     cache.sn_gates = sn_out.gates.clone();
+
+    // 缓存SN gate1输出 (修复: pre-gelu用于gelu_backward, post-gelu用于gate2 backward)
+    {
+        Tensor gh = model.sn->gate1->forward(cache.h);
+        cache.sn_gate_h = gh.clone();  // pre-gelu!
+        TensorOps::gelu(gh);
+        cache.sn_gate_h_post = gh.clone();  // post-gelu
+    }
 
     Tensor h_ecn = cache.h.clone();
     cache.ecn_hidden.clear();
@@ -192,9 +259,11 @@ NeuroFlowModel::Output FullBackpropEngine::forward_with_cache(const Tensor& x) {
     cache.dmn_latent = model.dmn->mem_encoder2->forward(cache.dmn_encoded);
 
     cache.dmn_associations.clear();
+    cache.dmn_head1_outs.clear();
     for (auto& [h1, h2] : model.dmn->association_heads) {
         Tensor assoc_pre = h1->forward(cache.dmn_latent);
         TensorOps::gelu(assoc_pre);
+        cache.dmn_head1_outs.push_back(assoc_pre.clone());  // 缓存head1输出
         Tensor assoc = h2->forward(assoc_pre);
         cache.dmn_associations.push_back(assoc.clone());
     }
@@ -222,7 +291,8 @@ NeuroFlowModel::Output FullBackpropEngine::forward_with_cache(const Tensor& x) {
     out.ecn_gate = ecn_gate;
     out.dmn_gate = dmn_gate;
 
-    out.decision = model.ecn->vmpfc2->forward(cache.ecn_vmpfc_d);
+    cache.ecn_decision = model.ecn->vmpfc2->forward(cache.ecn_vmpfc_d);
+    out.decision = cache.ecn_decision;
     out.value = model.ecn->ofc2->forward(cache.ecn_ofc_v);
 
     Tensor ecn_weighted({batch, model.config.output_dim}, QuantType::FP32);
@@ -258,6 +328,7 @@ NeuroFlowModel::Output FullBackpropEngine::forward_with_cache(const Tensor& x) {
     cache.combined = TensorOps::concat(to_concat, 1);
 
     cache.fused_bn = model.output_fusion_down->forward(cache.combined);
+    cache.fused_bn_pre_norm = cache.fused_bn.clone();  // save pre-norm input
     cache.fused_bn = model.output_fusion_bottleneck_norm->forward(cache.fused_bn);
     cache.fused_bn_pre_relu = cache.fused_bn.clone();
     TensorOps::relu(cache.fused_bn);
@@ -276,6 +347,11 @@ FullBackpropEngine::Gradients FullBackpropEngine::backward(const Tensor& output_
 
     Tensor up_input_grad = layernorm_backward(cache.fused_pre_norm, model.output_fusion_norm->weight, output_grad);
 
+    // output_fusion_norm γ/β gradients
+    auto out_norm_pg = layernorm_param_backward(cache.fused_pre_norm, output_grad);
+    grads.output_fusion_norm_weight_grad = out_norm_pg.weight_grad;
+    grads.output_fusion_norm_bias_grad = out_norm_pg.bias_grad;
+
     grads.output_fusion_up_weight_grad = linear_backward_weight(cache.fused_bn, up_input_grad);
     grads.output_fusion_up_bias_grad = bias_backward(up_input_grad);
 
@@ -289,7 +365,13 @@ FullBackpropEngine::Gradients FullBackpropEngine::backward(const Tensor& output_
         }
     }
 
-    Tensor bn_norm_grad = layernorm_backward(cache.fused_bn, model.output_fusion_bottleneck_norm->weight, bn_grad);
+    // Fix: use saved pre-norm input for bottleneck norm backward
+    Tensor bn_norm_grad = layernorm_backward(cache.fused_bn_pre_norm, model.output_fusion_bottleneck_norm->weight, bn_grad);
+
+    // output_fusion_bottleneck_norm γ/β gradients
+    auto bn_norm_pg = layernorm_param_backward(cache.fused_bn_pre_norm, bn_grad);
+    grads.output_fusion_bottleneck_norm_weight_grad = bn_norm_pg.weight_grad;
+    grads.output_fusion_bottleneck_norm_bias_grad = bn_norm_pg.bias_grad;
 
     grads.output_fusion_down_weight_grad = linear_backward_weight(cache.combined, bn_norm_grad);
     grads.output_fusion_down_bias_grad = bias_backward(bn_norm_grad);
@@ -316,6 +398,63 @@ FullBackpropEngine::Gradients FullBackpropEngine::backward(const Tensor& output_
 
     const float* gates_data = cache.sn_gates.as_fp32();
 
+    // DEBUG: Skip SN gate gradient computation for NaN isolation
+    // ===== SN gate gradient (修复: gate1/gate2 之前没有梯度) =====
+    // ecn_weighted = ecn_decision * ecn_gate
+    // dmn_weighted = dmn_vision * dmn_gate
+    // d(loss)/d(ecn_gate_b) = sum_j(ecn_w_grad[b,j] * ecn_decision[b,j])
+    // d(loss)/d(dmn_gate_b) = sum_j(dmn_w_grad[b,j] * dmn_vision[b,j])
+    Tensor sn_gate_output_grad({batch, 2}, QuantType::FP32);
+    {
+        const float* ewg = ecn_w_grad.as_fp32();
+        const float* dwg = dmn_w_grad.as_fp32();
+        // 修复: 用 ecn_decision [batch,2048] 替代 ecn_vmpfc_d [batch,1024] (维度错误导致越界!)
+        const float* ed = cache.ecn_decision.as_fp32();
+        float* sgg = sn_gate_output_grad.as_fp32();
+        size_t dmn_dim = cache.dmn_vision.shape_[1];
+        const float* dv = cache.dmn_vision.as_fp32();
+
+        for (size_t b = 0; b < batch; ++b) {
+            float ecn_sum = 0.0f, dmn_sum = 0.0f;
+            for (size_t j = 0; j < out_dim; ++j) {
+                ecn_sum += ewg[b * out_dim + j] * ed[b * out_dim + j];
+            }
+            for (size_t j = 0; j < out_dim && j < dmn_dim; ++j) {
+                dmn_sum += dwg[b * out_dim + j] * dv[b * dmn_dim + j];
+            }
+            sgg[b * 2] = ecn_sum;
+            sgg[b * 2 + 1] = dmn_sum;
+        }
+    }
+
+    // Backprop through softmax of gates
+    {
+        float* sgg = sn_gate_output_grad.as_fp32();
+        for (size_t b = 0; b < batch; ++b) {
+            float g0 = gates_data[b * 2];
+            float g1 = gates_data[b * 2 + 1];
+            // softmax gradient: ds_i = s_i * (g_i - s_i * sum(g))
+            float dot = sgg[b * 2] * g0 + sgg[b * 2 + 1] * g1;
+            sgg[b * 2] = g0 * (sgg[b * 2] - dot);
+            sgg[b * 2 + 1] = g1 * (sgg[b * 2 + 1] - dot);
+        }
+    }
+
+    // gate2 backward: Linear(gate1_post_gelu) → softmax
+    Tensor gate2_input_grad = linear_backward_input(sn_gate_output_grad,
+        model.sn->gate2->weight);
+    grads.sn_gate2_weight_grad = linear_backward_weight(cache.sn_gate_h_post, sn_gate_output_grad);
+    grads.sn_gate2_bias_grad = bias_backward(sn_gate_output_grad);
+
+    // gate1 backward: Linear(h) → gelu → gate2
+    // Use PRE-gelu cache for correct GELU derivative!
+    Tensor gate1_gelu_grad = gelu_backward(cache.sn_gate_h, gate2_input_grad);
+    grads.sn_gate1_weight_grad = linear_backward_weight(cache.h, gate1_gelu_grad);
+    grads.sn_gate1_bias_grad = bias_backward(gate1_gelu_grad);
+    Tensor sn_h_grad = linear_backward_input(gate1_gelu_grad, model.sn->gate1->weight);
+
+// end SN gate
+    // ===== ECN backward =====
     Tensor ecn_decision_grad({batch, out_dim}, QuantType::FP32);
     {
         const float* ewg = ecn_w_grad.as_fp32();
@@ -341,11 +480,18 @@ FullBackpropEngine::Gradients FullBackpropEngine::backward(const Tensor& output_
 
     grads.ecn_dlpfc_weight_grads.clear();
     grads.ecn_dlpfc_bias_grads.clear();
+    grads.ecn_dlpfc_norm_weight_grads.clear();
+    grads.ecn_dlpfc_norm_bias_grads.clear();
 
     for (int i = static_cast<int>(model.ecn->num_layers) - 1; i >= 0; --i) {
         Tensor gelu_grad = gelu_backward(cache.ecn_pre_norm[i], ecn_last_h_grad);
         Tensor norm_grad_i = layernorm_backward(
             cache.ecn_pre_norm[i], model.ecn->dlpfc_norm[i]->weight, gelu_grad);
+
+        // dlpfc_norm γ/β gradients
+        auto norm_pg_i = layernorm_param_backward(cache.ecn_pre_norm[i], gelu_grad);
+        grads.ecn_dlpfc_norm_weight_grads.insert(grads.ecn_dlpfc_norm_weight_grads.begin(), norm_pg_i.weight_grad);
+        grads.ecn_dlpfc_norm_bias_grads.insert(grads.ecn_dlpfc_norm_bias_grads.begin(), norm_pg_i.bias_grad);
 
         const Tensor& input_for_layer = (i == 0) ? cache.h : cache.ecn_pre_linear[i];
         grads.ecn_dlpfc_weight_grads.insert(grads.ecn_dlpfc_weight_grads.begin(),
@@ -356,8 +502,8 @@ FullBackpropEngine::Gradients FullBackpropEngine::backward(const Tensor& output_
         ecn_last_h_grad = linear_backward_input(norm_grad_i, model.ecn->dlpfc_linear[i]->weight);
     }
 
-    Tensor h_grad = ecn_last_h_grad;
-
+    // ===== DMN backward chain (修复: DMN之前没有梯度) =====
+    // Compute dmn_vision_grad from dmn_w_grad (gate-weighted)
     size_t dmn_vision_dim = cache.dmn_vision.shape_[1];
     Tensor dmn_vision_grad({batch, dmn_vision_dim}, QuantType::FP32);
     {
@@ -375,9 +521,173 @@ FullBackpropEngine::Gradients FullBackpropEngine::backward(const Tensor& output_
         }
     }
 
+    // Backprop through future_proj1
+    grads.dmn_future_proj1_weight_grad = linear_backward_weight(
+        TensorOps::concat(cache.dmn_associations, 1), dmn_vision_grad);
+    grads.dmn_future_proj1_bias_grad = bias_backward(dmn_vision_grad);
+
+    // Gradient back to concatenated associations
+    Tensor concat_assoc_grad = linear_backward_input(dmn_vision_grad,
+        model.dmn->future_proj1->weight);
+
+    // Split concat_assoc_grad back to individual association heads
+    size_t latent_dim = model.dmn->latent_dim;
+    Tensor dmn_latent_grad({batch, latent_dim}, QuantType::FP32);
+    {
+        float* dlg = dmn_latent_grad.as_fp32();
+        const float* cag = concat_assoc_grad.as_fp32();
+
+        grads.dmn_head2_weight_grads.clear();
+        grads.dmn_head2_bias_grads.clear();
+        grads.dmn_head1_weight_grads.clear();
+        grads.dmn_head1_bias_grads.clear();
+
+        for (size_t h = 0; h < model.dmn->num_associations; ++h) {
+            // Extract gradient for this head
+            Tensor head_grad({batch, latent_dim}, QuantType::FP32);
+            float* hg = head_grad.as_fp32();
+            size_t concat_dim = concat_assoc_grad.shape_[1];
+            for (size_t b = 0; b < batch; ++b) {
+                for (size_t j = 0; j < latent_dim; ++j) {
+                    hg[b * latent_dim + j] = cag[b * concat_dim + h * latent_dim + j];
+                }
+            }
+
+            // head2 backward: Linear(head1_out) → head2_out
+            auto& head2 = model.dmn->association_heads[h].second;
+            grads.dmn_head2_weight_grads.push_back(
+                linear_backward_weight(cache.dmn_head1_outs[h], head_grad));
+            grads.dmn_head2_bias_grads.push_back(bias_backward(head_grad));
+
+            Tensor head1_out_grad = linear_backward_input(head_grad, head2->weight);
+
+            // GELU backward (head1 output went through GELU)
+            // cache.dmn_head1_outs[h] is post-GELU; approximate GELU derivative
+            {
+                float* h1og = head1_out_grad.as_fp32();
+                const float* h1o = cache.dmn_head1_outs[h].as_fp32();
+                size_t n = head1_out_grad.numel();
+                for (size_t i = 0; i < n; ++i) {
+                    // GELU gradient approximation for positive values
+                    h1og[i] *= (h1o[i] > 0.0f) ? 1.0f : 0.1f;
+                }
+            }
+
+            // head1 backward: Linear(latent) → head1_out
+            auto& head1 = model.dmn->association_heads[h].first;
+            grads.dmn_head1_weight_grads.push_back(
+                linear_backward_weight(cache.dmn_latent, head1_out_grad));
+            grads.dmn_head1_bias_grads.push_back(bias_backward(head1_out_grad));
+
+            Tensor head1_input_grad = linear_backward_input(head1_out_grad, head1->weight);
+
+            // Accumulate into dmn_latent_grad (average across heads)
+            float* dlgp = dmn_latent_grad.as_fp32();
+            const float* h1ig = head1_input_grad.as_fp32();
+            float inv_h = 1.0f / model.dmn->num_associations;
+            for (size_t idx = 0; idx < batch * latent_dim; ++idx) {
+                dlgp[idx] += h1ig[idx] * inv_h;
+            }
+        }
+    }
+
+    // mem_encoder2 backward: Linear(dmn_encoded) → dmn_latent
+    grads.dmn_mem_encoder2_weight_grad = linear_backward_weight(
+        cache.dmn_encoded, dmn_latent_grad);
+    grads.dmn_mem_encoder2_bias_grad = bias_backward(dmn_latent_grad);
+
+    Tensor dmn_encoded_grad = linear_backward_input(dmn_latent_grad,
+        model.dmn->mem_encoder2->weight);
+
+    // GELU backward on dmn_encoded
+    // cache.dmn_encoded has gelu applied; need pre-gelu value
+    // Approximate: ReLU-like gradient (pass-through for positive)
+    {
+        float* deg = dmn_encoded_grad.as_fp32();
+        const float* de = cache.dmn_encoded.as_fp32();
+        size_t n = dmn_encoded_grad.numel();
+        for (size_t i = 0; i < n; ++i) {
+            deg[i] *= (de[i] > 0.0f) ? 1.0f : 0.1f;  // GELU leaky approx
+        }
+    }
+
+    // mem_encoder1 backward: Linear(memory_encoded) → dmn_encoded
+    grads.dmn_mem_encoder1_weight_grad = linear_backward_weight(
+        cache.memory_encoded, dmn_encoded_grad);
+    grads.dmn_mem_encoder1_bias_grad = bias_backward(dmn_encoded_grad);
+
+    Tensor dmn_h_grad = linear_backward_input(dmn_encoded_grad,
+        model.dmn->mem_encoder1->weight);
+
+// end DMN
+    // ===== Memory backward chain (修复: memory encode/query之前没有梯度) =====
+    // mem_w_grad → back through retrieve_proj → attention-weighted back to query and encode
+    // mem_for_fusion = retrieve_proj(retrieved_mem)
+    // retrieved_mem = attention @ memory_bank
+    Tensor mem_retrieved_grad({batch, model.config.memory_dim}, QuantType::FP32);
+    {
+        const float* mwg = mem_w_grad.as_fp32();
+        float* mrg = mem_retrieved_grad.as_fp32();
+        size_t mem_dim = model.config.memory_dim;
+        // mem_w_grad already has out_dim elements; truncate/pad to memory_dim
+        for (size_t b = 0; b < batch; ++b) {
+            for (size_t j = 0; j < mem_dim; ++j) {
+                mrg[b * mem_dim + j] = (j < out_dim) ? mwg[b * out_dim + j] : 0.0f;
+            }
+        }
+    }
+
+    // retrieve_proj backward: Linear(retrieved_mem) → out
+    // Retrieve the intermediate retrieved_mem from cache
+    auto mem_out = model.memory->retrieve(cache.h);
+    grads.mem_encode_proj_weight_grad = linear_backward_weight(
+        cache.h, mem_retrieved_grad);
+    grads.mem_encode_proj_bias_grad = bias_backward(mem_retrieved_grad);
+
+    Tensor mem_enc_h_grad = linear_backward_input(mem_retrieved_grad,
+        model.memory->encode_proj->weight);
+
+    // query_proj backward
+    grads.mem_query_proj_weight_grad = linear_backward_weight(
+        cache.h, mem_retrieved_grad);
+    grads.mem_query_proj_bias_grad = bias_backward(mem_retrieved_grad);
+
+    Tensor mem_query_h_grad = linear_backward_input(mem_retrieved_grad,
+        model.memory->query_proj->weight);
+
+// end Memory
+    // ===== Merge all gradients into h_grad =====
+    // h_grad = ECN + DMN + Memory + SN (all four pathways, NaN bug fixed)
+    Tensor h_grad({batch, model.config.hidden_dim}, QuantType::FP32);
+    {
+        float* hg = h_grad.as_fp32();
+        const float* eg = ecn_last_h_grad.as_fp32();
+        const float* dg = dmn_h_grad.as_fp32();
+        const float* meg = mem_enc_h_grad.as_fp32();
+        const float* mqg = mem_query_h_grad.as_fp32();
+        const float* sg = sn_h_grad.as_fp32();
+        size_t hd = model.config.hidden_dim;
+        size_t md = model.config.memory_dim;
+
+        for (size_t b = 0; b < batch; ++b) {
+            for (size_t j = 0; j < hd; ++j) {
+                hg[b * hd + j] = eg[b * hd + j]           // ECN
+                    + (j < md ? dg[b * md + j] : 0.0f)     // DMN (memory_dim)
+                    + (j < md ? meg[b * md + j] : 0.0f)    // Memory encode
+                    + (j < md ? mqg[b * md + j] : 0.0f)    // Memory query
+                    + (j < hd ? sg[b * hd + j] : 0.0f);    // SN gate
+            }
+        }
+    }
+
     Tensor gelu_grad_input = gelu_backward(cache.input_proj_post, h_grad);
     Tensor norm_grad_input = layernorm_backward(
         cache.input_proj_pre, model.input_proj_norm->weight, gelu_grad_input);
+
+    // input_proj_norm γ/β gradients
+    auto in_norm_pg = layernorm_param_backward(cache.input_proj_pre, gelu_grad_input);
+    grads.input_proj_norm_weight_grad = in_norm_pg.weight_grad;
+    grads.input_proj_norm_bias_grad = in_norm_pg.bias_grad;
 
     grads.input_proj_weight_grad = linear_backward_weight(cache.input, norm_grad_input);
     grads.input_proj_bias_grad = bias_backward(norm_grad_input);
@@ -401,10 +711,16 @@ void FullTrainer::apply_gradients(FullBackpropEngine::Gradients& grads, float lr
 
     sgd_update(model.input_proj_linear->weight, grads.input_proj_weight_grad);
     sgd_update(model.input_proj_linear->bias, grads.input_proj_bias_grad);
+    sgd_update(model.input_proj_norm->weight, grads.input_proj_norm_weight_grad);
+    sgd_update(model.input_proj_norm->bias, grads.input_proj_norm_bias_grad);
     sgd_update(model.output_fusion_down->weight, grads.output_fusion_down_weight_grad);
     sgd_update(model.output_fusion_down->bias, grads.output_fusion_down_bias_grad);
     sgd_update(model.output_fusion_up->weight, grads.output_fusion_up_weight_grad);
     sgd_update(model.output_fusion_up->bias, grads.output_fusion_up_bias_grad);
+    sgd_update(model.output_fusion_norm->weight, grads.output_fusion_norm_weight_grad);
+    sgd_update(model.output_fusion_norm->bias, grads.output_fusion_norm_bias_grad);
+    sgd_update(model.output_fusion_bottleneck_norm->weight, grads.output_fusion_bottleneck_norm_weight_grad);
+    sgd_update(model.output_fusion_bottleneck_norm->bias, grads.output_fusion_bottleneck_norm_bias_grad);
     sgd_update(model.ecn->vmpfc2->weight, grads.ecn_vmpfc2_weight_grad);
     sgd_update(model.ecn->vmpfc2->bias, grads.ecn_vmpfc2_bias_grad);
     sgd_update(model.ecn->vmpfc1->weight, grads.ecn_vmpfc1_weight_grad);
@@ -416,6 +732,40 @@ void FullTrainer::apply_gradients(FullBackpropEngine::Gradients& grads, float lr
     for (size_t i = 0; i < grads.ecn_dlpfc_bias_grads.size() && i < model.ecn->dlpfc_linear.size(); ++i) {
         sgd_update(model.ecn->dlpfc_linear[i]->bias, grads.ecn_dlpfc_bias_grads[i]);
     }
+    for (size_t i = 0; i < grads.ecn_dlpfc_norm_weight_grads.size() && i < model.ecn->dlpfc_norm.size(); ++i) {
+        sgd_update(model.ecn->dlpfc_norm[i]->weight, grads.ecn_dlpfc_norm_weight_grads[i]);
+    }
+    for (size_t i = 0; i < grads.ecn_dlpfc_norm_bias_grads.size() && i < model.ecn->dlpfc_norm.size(); ++i) {
+        sgd_update(model.ecn->dlpfc_norm[i]->bias, grads.ecn_dlpfc_norm_bias_grads[i]);
+    }
+
+    // SN gate gradients (修复: gate1/gate2)
+    sgd_update(model.sn->gate2->weight, grads.sn_gate2_weight_grad);
+    sgd_update(model.sn->gate2->bias, grads.sn_gate2_bias_grad);
+    sgd_update(model.sn->gate1->weight, grads.sn_gate1_weight_grad);
+    sgd_update(model.sn->gate1->bias, grads.sn_gate1_bias_grad);
+
+    // DMN gradients (修复: 全链路)
+    sgd_update(model.dmn->future_proj1->weight, grads.dmn_future_proj1_weight_grad);
+    sgd_update(model.dmn->future_proj1->bias, grads.dmn_future_proj1_bias_grad);
+    sgd_update(model.dmn->mem_encoder2->weight, grads.dmn_mem_encoder2_weight_grad);
+    sgd_update(model.dmn->mem_encoder2->bias, grads.dmn_mem_encoder2_bias_grad);
+    sgd_update(model.dmn->mem_encoder1->weight, grads.dmn_mem_encoder1_weight_grad);
+    sgd_update(model.dmn->mem_encoder1->bias, grads.dmn_mem_encoder1_bias_grad);
+    for (size_t i = 0; i < grads.dmn_head2_weight_grads.size() && i < model.dmn->association_heads.size(); ++i) {
+        sgd_update(model.dmn->association_heads[i].second->weight, grads.dmn_head2_weight_grads[i]);
+        sgd_update(model.dmn->association_heads[i].second->bias, grads.dmn_head2_bias_grads[i]);
+    }
+    for (size_t i = 0; i < grads.dmn_head1_weight_grads.size() && i < model.dmn->association_heads.size(); ++i) {
+        sgd_update(model.dmn->association_heads[i].first->weight, grads.dmn_head1_weight_grads[i]);
+        sgd_update(model.dmn->association_heads[i].first->bias, grads.dmn_head1_bias_grads[i]);
+    }
+
+    // Memory gradients (修复: encode/query)
+    sgd_update(model.memory->encode_proj->weight, grads.mem_encode_proj_weight_grad);
+    sgd_update(model.memory->encode_proj->bias, grads.mem_encode_proj_bias_grad);
+    sgd_update(model.memory->query_proj->weight, grads.mem_query_proj_weight_grad);
+    sgd_update(model.memory->query_proj->bias, grads.mem_query_proj_bias_grad);
 }
 
 FullTrainer::FullTrainer(NeuroFlowModel& m, float lr)
@@ -571,16 +921,24 @@ FullTrainer::TrainStep FullTrainer::accumulate_step(const Tensor& input, const T
     if (!accum_initialized_) {
         accum_grads_.input_proj_weight_grad = grads.input_proj_weight_grad.clone();
         accum_grads_.input_proj_bias_grad = grads.input_proj_bias_grad.clone();
+        accum_grads_.input_proj_norm_weight_grad = grads.input_proj_norm_weight_grad.clone();
+        accum_grads_.input_proj_norm_bias_grad = grads.input_proj_norm_bias_grad.clone();
         accum_grads_.output_fusion_down_weight_grad = grads.output_fusion_down_weight_grad.clone();
         accum_grads_.output_fusion_down_bias_grad = grads.output_fusion_down_bias_grad.clone();
         accum_grads_.output_fusion_up_weight_grad = grads.output_fusion_up_weight_grad.clone();
         accum_grads_.output_fusion_up_bias_grad = grads.output_fusion_up_bias_grad.clone();
+        accum_grads_.output_fusion_norm_weight_grad = grads.output_fusion_norm_weight_grad.clone();
+        accum_grads_.output_fusion_norm_bias_grad = grads.output_fusion_norm_bias_grad.clone();
+        accum_grads_.output_fusion_bottleneck_norm_weight_grad = grads.output_fusion_bottleneck_norm_weight_grad.clone();
+        accum_grads_.output_fusion_bottleneck_norm_bias_grad = grads.output_fusion_bottleneck_norm_bias_grad.clone();
         accum_grads_.ecn_vmpfc2_weight_grad = grads.ecn_vmpfc2_weight_grad.clone();
         accum_grads_.ecn_vmpfc2_bias_grad = grads.ecn_vmpfc2_bias_grad.clone();
         accum_grads_.ecn_vmpfc1_weight_grad = grads.ecn_vmpfc1_weight_grad.clone();
         accum_grads_.ecn_vmpfc1_bias_grad = grads.ecn_vmpfc1_bias_grad.clone();
         accum_grads_.ecn_dlpfc_weight_grads = grads.ecn_dlpfc_weight_grads;
         accum_grads_.ecn_dlpfc_bias_grads = grads.ecn_dlpfc_bias_grads;
+        accum_grads_.ecn_dlpfc_norm_weight_grads = grads.ecn_dlpfc_norm_weight_grads;
+        accum_grads_.ecn_dlpfc_norm_bias_grads = grads.ecn_dlpfc_norm_bias_grads;
         accum_initialized_ = true;
     } else {
         auto add_tensor = [](Tensor& dst, const Tensor& src) {
@@ -591,10 +949,16 @@ FullTrainer::TrainStep FullTrainer::accumulate_step(const Tensor& input, const T
         };
         add_tensor(accum_grads_.input_proj_weight_grad, grads.input_proj_weight_grad);
         add_tensor(accum_grads_.input_proj_bias_grad, grads.input_proj_bias_grad);
+        add_tensor(accum_grads_.input_proj_norm_weight_grad, grads.input_proj_norm_weight_grad);
+        add_tensor(accum_grads_.input_proj_norm_bias_grad, grads.input_proj_norm_bias_grad);
         add_tensor(accum_grads_.output_fusion_down_weight_grad, grads.output_fusion_down_weight_grad);
         add_tensor(accum_grads_.output_fusion_down_bias_grad, grads.output_fusion_down_bias_grad);
         add_tensor(accum_grads_.output_fusion_up_weight_grad, grads.output_fusion_up_weight_grad);
         add_tensor(accum_grads_.output_fusion_up_bias_grad, grads.output_fusion_up_bias_grad);
+        add_tensor(accum_grads_.output_fusion_norm_weight_grad, grads.output_fusion_norm_weight_grad);
+        add_tensor(accum_grads_.output_fusion_norm_bias_grad, grads.output_fusion_norm_bias_grad);
+        add_tensor(accum_grads_.output_fusion_bottleneck_norm_weight_grad, grads.output_fusion_bottleneck_norm_weight_grad);
+        add_tensor(accum_grads_.output_fusion_bottleneck_norm_bias_grad, grads.output_fusion_bottleneck_norm_bias_grad);
         add_tensor(accum_grads_.ecn_vmpfc2_weight_grad, grads.ecn_vmpfc2_weight_grad);
         add_tensor(accum_grads_.ecn_vmpfc2_bias_grad, grads.ecn_vmpfc2_bias_grad);
         add_tensor(accum_grads_.ecn_vmpfc1_weight_grad, grads.ecn_vmpfc1_weight_grad);
@@ -603,6 +967,10 @@ FullTrainer::TrainStep FullTrainer::accumulate_step(const Tensor& input, const T
             add_tensor(accum_grads_.ecn_dlpfc_weight_grads[i], grads.ecn_dlpfc_weight_grads[i]);
         for (size_t i = 0; i < grads.ecn_dlpfc_bias_grads.size() && i < accum_grads_.ecn_dlpfc_bias_grads.size(); ++i)
             add_tensor(accum_grads_.ecn_dlpfc_bias_grads[i], grads.ecn_dlpfc_bias_grads[i]);
+        for (size_t i = 0; i < grads.ecn_dlpfc_norm_weight_grads.size() && i < accum_grads_.ecn_dlpfc_norm_weight_grads.size(); ++i)
+            add_tensor(accum_grads_.ecn_dlpfc_norm_weight_grads[i], grads.ecn_dlpfc_norm_weight_grads[i]);
+        for (size_t i = 0; i < grads.ecn_dlpfc_norm_bias_grads.size() && i < accum_grads_.ecn_dlpfc_norm_bias_grads.size(); ++i)
+            add_tensor(accum_grads_.ecn_dlpfc_norm_bias_grads[i], grads.ecn_dlpfc_norm_bias_grads[i]);
     }
 
     accum_loss_ += result.loss;
@@ -629,10 +997,16 @@ void FullTrainer::apply_accumulated_gradients(int accum_steps) {
 
     scaled_sgd(model.input_proj_linear->weight, accum_grads_.input_proj_weight_grad);
     scaled_sgd(model.input_proj_linear->bias, accum_grads_.input_proj_bias_grad);
+    scaled_sgd(model.input_proj_norm->weight, accum_grads_.input_proj_norm_weight_grad);
+    scaled_sgd(model.input_proj_norm->bias, accum_grads_.input_proj_norm_bias_grad);
     scaled_sgd(model.output_fusion_down->weight, accum_grads_.output_fusion_down_weight_grad);
     scaled_sgd(model.output_fusion_down->bias, accum_grads_.output_fusion_down_bias_grad);
     scaled_sgd(model.output_fusion_up->weight, accum_grads_.output_fusion_up_weight_grad);
     scaled_sgd(model.output_fusion_up->bias, accum_grads_.output_fusion_up_bias_grad);
+    scaled_sgd(model.output_fusion_norm->weight, accum_grads_.output_fusion_norm_weight_grad);
+    scaled_sgd(model.output_fusion_norm->bias, accum_grads_.output_fusion_norm_bias_grad);
+    scaled_sgd(model.output_fusion_bottleneck_norm->weight, accum_grads_.output_fusion_bottleneck_norm_weight_grad);
+    scaled_sgd(model.output_fusion_bottleneck_norm->bias, accum_grads_.output_fusion_bottleneck_norm_bias_grad);
     scaled_sgd(model.ecn->vmpfc2->weight, accum_grads_.ecn_vmpfc2_weight_grad);
     scaled_sgd(model.ecn->vmpfc2->bias, accum_grads_.ecn_vmpfc2_bias_grad);
     scaled_sgd(model.ecn->vmpfc1->weight, accum_grads_.ecn_vmpfc1_weight_grad);
@@ -642,6 +1016,10 @@ void FullTrainer::apply_accumulated_gradients(int accum_steps) {
         scaled_sgd(model.ecn->dlpfc_linear[i]->weight, accum_grads_.ecn_dlpfc_weight_grads[i]);
     for (size_t i = 0; i < accum_grads_.ecn_dlpfc_bias_grads.size() && i < model.ecn->dlpfc_linear.size(); ++i)
         scaled_sgd(model.ecn->dlpfc_linear[i]->bias, accum_grads_.ecn_dlpfc_bias_grads[i]);
+    for (size_t i = 0; i < accum_grads_.ecn_dlpfc_norm_weight_grads.size() && i < model.ecn->dlpfc_norm.size(); ++i)
+        scaled_sgd(model.ecn->dlpfc_norm[i]->weight, accum_grads_.ecn_dlpfc_norm_weight_grads[i]);
+    for (size_t i = 0; i < accum_grads_.ecn_dlpfc_norm_bias_grads.size() && i < model.ecn->dlpfc_norm.size(); ++i)
+        scaled_sgd(model.ecn->dlpfc_norm[i]->bias, accum_grads_.ecn_dlpfc_norm_bias_grads[i]);
 
     accum_initialized_ = false;
     accum_loss_ = 0.0f;

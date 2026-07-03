@@ -13,12 +13,12 @@
  * + 神经流形分析
  */
 
-#include "tensor.hpp"
-#include "networks.hpp"
-#include "memory.hpp"
-#include <vector>
 #include <memory>
 #include <unordered_map>
+#include <vector>
+#include "memory.hpp"
+#include "networks.hpp"
+#include "tensor.hpp"
 
 namespace neuroflow {
 
@@ -30,23 +30,29 @@ public:
     // 配置
     struct Config {
         size_t input_dim = 512;
-        size_t hidden_dim = 256;
-        size_t output_dim = 10;
-        size_t memory_dim = 128;
+        size_t hidden_dim = 2048;
+        size_t output_dim = 2048;
+        size_t memory_dim = 512;
         size_t memory_slots = 64;
-        size_t num_layers = 2;
+        size_t num_layers = 12;
         size_t num_associations = 8;
         bool use_quantization = false;
         bool use_mla = false;
         size_t mla_latent_dim = 32;
         bool use_causal_lm = false;
         size_t vocab_size = 128000;
-        size_t max_seq_len = 128;
+        size_t max_seq_len = 512;
         std::string tokenizer_path = "";
-        size_t causal_window_size = 32;
+        size_t causal_window_size = 64;
         size_t sae_k = 64;
         size_t ntm_memory_slots = 16;
         size_t fusion_bottleneck_dim = 256;
+        size_t lm_num_attn_layers = 2;
+        size_t lm_num_attn_heads = 4;
+        std::string lm_pooling = "mean";
+        size_t mla_n_heads = 8;
+        size_t mla_max_cache_len = 4096;
+        size_t d_model = 512;
     };
     
     Config config;
@@ -88,7 +94,7 @@ public:
         
         // ECN
         ecn = std::make_unique<ExecutiveControlNetwork>(
-            config.hidden_dim, config.hidden_dim, config.output_dim, config.num_layers);
+            config.hidden_dim, config.hidden_dim, config.hidden_dim, config.num_layers);
         
         // DMN
         dmn = std::make_unique<DefaultModeNetwork>(
@@ -115,13 +121,13 @@ public:
         manifold_gelu = std::make_shared<GELU>();
         manifold_proj2 = std::make_shared<Linear>(config.hidden_dim, 32);
         
-        // 输出融合 (低秩因式分解)
-        size_t fusion_in = config.output_dim * 3;
+        // 输出融合 (低秩因式分解: hidden_dim*3 -> bn -> hidden_dim)
+        size_t fusion_in = config.hidden_dim * 3;
         size_t bn = config.fusion_bottleneck_dim;
         output_fusion_down = std::make_shared<Linear>(fusion_in, bn);
         output_fusion_bottleneck_norm = std::make_shared<LayerNorm>(bn);
-        output_fusion_up = std::make_shared<Linear>(bn, config.output_dim);
-        output_fusion_norm = std::make_shared<LayerNorm>(config.output_dim);
+        output_fusion_up = std::make_shared<Linear>(bn, config.hidden_dim);
+        output_fusion_norm = std::make_shared<LayerNorm>(config.hidden_dim);
         
         // 量化
         if (config.use_quantization) {
@@ -200,7 +206,7 @@ public:
         }
         
         // 门控加权 - 创建新的张量，避免修改共享数据
-        Tensor ecn_weighted({batch, config.output_dim}, QuantType::FP32);
+        Tensor ecn_weighted({batch, config.hidden_dim}, QuantType::FP32);
         Tensor dmn_weighted_full({batch, dmn_out.vision.shape_[1]}, QuantType::FP32);
         
         float* ew = ecn_weighted.as_fp32();
@@ -212,8 +218,8 @@ public:
         
         // ECN加权
         for (size_t i = 0; i < batch; ++i) {
-            for (size_t j = 0; j < config.output_dim; ++j) {
-                ew[i * config.output_dim + j] = ed[i * config.output_dim + j] * eg[i];
+            for (size_t j = 0; j < config.hidden_dim; ++j) {
+                ew[i * config.hidden_dim + j] = ed[i * config.hidden_dim + j] * eg[i];
             }
         }
         
@@ -224,15 +230,15 @@ public:
             }
         }
         
-        // 只取output_dim部分
-        Tensor dmn_weighted({batch, config.output_dim}, QuantType::FP32);
+        // 只取hidden_dim部分
+        Tensor dmn_weighted({batch, config.hidden_dim}, QuantType::FP32);
         float* dwf = dmn_weighted.as_fp32();
         for (size_t i = 0; i < batch; ++i) {
-            for (size_t j = 0; j < config.output_dim; ++j) {
+            for (size_t j = 0; j < config.hidden_dim; ++j) {
                 if (j < dmn_out.vision.shape_[1]) {
-                    dwf[i * config.output_dim + j] = dw[i * dmn_out.vision.shape_[1] + j];
+                    dwf[i * config.hidden_dim + j] = dw[i * dmn_out.vision.shape_[1] + j];
                 } else {
-                    dwf[i * config.output_dim + j] = 0.0f;
+                    dwf[i * config.hidden_dim + j] = 0.0f;
                 }
             }
         }
@@ -243,26 +249,26 @@ public:
         to_concat.push_back(dmn_weighted);
         
         Tensor mem_for_fusion = out.retrieved_mem.clone();
-        if (mem_for_fusion.shape_[1] > config.output_dim) {
+        if (mem_for_fusion.shape_[1] > config.hidden_dim) {
             // 截取 (不是reshape)
-            Tensor truncated({batch, config.output_dim}, QuantType::FP32);
+            Tensor truncated({batch, config.hidden_dim}, QuantType::FP32);
             float* tw = truncated.as_fp32();
             float* mw = mem_for_fusion.as_fp32();
             for (size_t i = 0; i < batch; ++i) {
-                for (size_t j = 0; j < config.output_dim; ++j) {
-                    tw[i * config.output_dim + j] = mw[i * mem_for_fusion.shape_[1] + j];
+                for (size_t j = 0; j < config.hidden_dim; ++j) {
+                    tw[i * config.hidden_dim + j] = mw[i * mem_for_fusion.shape_[1] + j];
                 }
             }
             mem_for_fusion = truncated;
-        } else if (mem_for_fusion.shape_[1] < config.output_dim) {
+        } else if (mem_for_fusion.shape_[1] < config.hidden_dim) {
             // 补零
-            Tensor padded({batch, config.output_dim}, QuantType::FP32);
+            Tensor padded({batch, config.hidden_dim}, QuantType::FP32);
             float* p = padded.as_fp32();
             float* m = mem_for_fusion.as_fp32();
             memset(p, 0, padded.data_size_);
             for (size_t i = 0; i < batch; ++i) {
                 for (size_t j = 0; j < mem_for_fusion.shape_[1]; ++j) {
-                    p[i * config.output_dim + j] = m[i * mem_for_fusion.shape_[1] + j];
+                    p[i * config.hidden_dim + j] = m[i * mem_for_fusion.shape_[1] + j];
                 }
             }
             mem_for_fusion = padded;

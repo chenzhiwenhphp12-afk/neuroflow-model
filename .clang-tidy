@@ -1,0 +1,95 @@
+# NeuroFlow C++ 静态分析检查配置
+# 基于 Google C++ Style Guide — 只启用不与现有代码大面积冲突的规则
+#
+# 用法:
+#   clang-tidy <file.cpp> -- -Iinclude -std=c++20
+#   # 或通过 CMake:
+#   cmake -DCMAKE_CXX_CLANG_TIDY="clang-tidy" ..
+
+---
+# ──── Google 核心规范检查 ────
+Checks: >
+  -*,
+  # 命名规范（仅新代码警告，旧代码不阻塞）
+  google-readability-*,
+  google-runtime-*,
+  google-build-*,
+  google-explicit-constructor,
+  google-global-names-in-headers,
+  
+  # C++ 现代写法检查
+  modernize-use-override,
+  modernize-use-nullptr,
+  modernize-use-using,
+  modernize-make-unique,
+  modernize-make-shared,
+  modernize-use-noexcept,
+  modernize-use-emplace,
+  modernize-loop-convert,
+  modernize-return-braced-init-list,
+  modernize-use-auto,
+  modernize-use-default-member-init,
+  
+  # 性能检查
+  performance-unnecessary-value-param,
+  performance-move-const-arg,
+  performance-for-range-copy,
+  performance-unnecessary-copy-initialization,
+  
+  # 可读性检查
+  readability-redundant-member-init,
+  readability-container-size-empty,
+  readability-simplify-boolean-expr,
+  readability-redundant-string-cstr,
+  readability-implicit-bool-conversion,
+  readability-make-member-function-const,
+  readability-avoid-const-params-in-decls,
+  
+  # Bug 预防
+  bugprone-unused-raii,
+  bugprone-use-after-move,
+  bugprone-suspicious-include,
+  bugprone-misplaced-widening-cast,
+  bugprone-integer-division,
+  bugprone-suspicious-memset-usage,
+
+  # 杂项
+  misc-unused-parameters,
+  misc-unused-using-decls,
+  misc-include-cleaner,
+  misc-const-correctness
+
+# ──── 故意不启用的检查（与现有代码冲突严重，将来逐步开启）────
+#   google-readability-casting        → 需大量 static_cast 替换
+#   readability-identifier-naming     → 等重命名完成后再开
+#   modernize-pass-by-value           → 需逐文件评估
+#   cppcoreguidelines-pro-type-const-cast → 太严格
+#   clang-analyzer-*                  → 太慢，CI 阶段用
+
+# ──── 配置项 ────
+CheckOptions:
+  # modernize-use-auto: MinTypeNameLength=5（长类型名才建议 auto）
+  - key: modernize-use-auto.MinTypeNameLength
+    value: '5'
+  
+  # modernize-use-auto: 移除星号时用 auto（而非 auto*）
+  - key: modernize-use-auto.RemoveStars
+    value: 'true'
+  
+  # misc-include-cleaner: 忽略标准库头（编译器内置路径）
+  - key: misc-include-cleaner.IgnoreHeaders
+    value: '^<.*\.h>$;^<.*>$'
+  
+  # readability-implicit-bool-conversion: 允许条件表达式中的隐式转换
+  - key: readability-implicit-bool-conversion.AllowIntegerConditions
+    value: 'true'
+  - key: readability-implicit-bool-conversion.AllowPointerConditions
+    value: 'true'
+  
+  # performance-unnecessary-value-param: 允许的值类型上限
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: 'std::string;std::vector'
+
+# ──── WarningsAsErrors ────
+# 把它注释掉表示不阻塞编译，只在 CI 中打开
+# WarningsAsErrors: '*'

@@ -1,8 +1,16 @@
+// 关联头文件
 #include "neuroflow/tensor.hpp"
-#include <iostream>
-#include <numeric>
-#include <future>
+
+// C++ 标准库
+#include <condition_variable>
 #include <functional>
+#include <future>
+#include <iostream>
+#include <mutex>
+#include <numeric>
+#include <queue>
+
+// 第三方库
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -17,6 +25,67 @@ constexpr size_t OMP_MIN_ITER = 1024;
 using omp_idx_t = long long;
 #else
 using omp_idx_t = size_t;
+#endif
+
+// 轻量级线程池 (仅在无OpenMP时使用)
+#ifndef _OPENMP
+class ThreadPool {
+public:
+    explicit ThreadPool(size_t n = std::thread::hardware_concurrency()) {
+        n = std::max(n, size_t(1));
+        for (size_t i = 0; i < n; ++i) {
+            workers_.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+                        if (stop_ && tasks_.empty()) return;
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable()) w.join();
+        }
+    }
+
+    void submit(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            tasks_.push(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+    void wait_all() {
+        // Simple barrier: wait until all tasks are done
+        while (true) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (tasks_.empty()) break;
+        }
+        // Give workers time to finish last tasks
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+};
 #endif
 
 }

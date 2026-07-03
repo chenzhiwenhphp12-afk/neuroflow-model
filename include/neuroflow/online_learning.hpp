@@ -14,15 +14,14 @@
 #define _USE_MATH_DEFINES
 #endif
 
-#include "tensor.hpp"
-#include "networks.hpp"
-#include "memory.hpp"
-#include "model.hpp"
-#include "backprop.hpp"
 #include <cmath>
-#define _USE_MATH_DEFINES
 #include <memory>
 #include <vector>
+#include "backprop.hpp"
+#include "memory.hpp"
+#include "model.hpp"
+#include "networks.hpp"
+#include "tensor.hpp"
 
 namespace neuroflow {
 

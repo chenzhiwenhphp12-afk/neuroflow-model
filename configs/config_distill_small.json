@@ -1,0 +1,23 @@
+{
+ "input_dim": 128,
+ "hidden_dim": 256,
+ "output_dim": 256,
+ "memory_dim": 64,
+ "memory_slots": 16,
+ "num_layers": 4,
+ "num_associations": 4,
+ "use_quantization": false,
+ "use_mla": false,
+ "mla_latent_dim": 16,
+ "use_causal_lm": true,
+ "vocab_size": 5000,
+ "max_seq_len": 128,
+ "causal_window_size": 16,
+ "sae_k": 32,
+ "ntm_memory_slots": 8,
+ "d_model": 128,
+ "mla_n_heads": 4,
+ "mla_max_cache_len": 256,
+ "lm_num_attn_layers": 2,
+ "lm_pooling": "mean"
+}

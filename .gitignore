@@ -1,14 +1,33 @@
 # Build
 build/
+build_*/
 *.o
 *.obj
 *.exe
 neuroflow_train_v2
 neuroflow_train_v2.exe
 
-# Output
-output/
-tok1_data/
+# Distill / training outputs
+distill_*/
+distill_output*/
+distill_test_*/
+distill_*_100ep/
+
+# Test temp files
+debug_test.txt
+test_128k_log.txt
+test_result.txt
+test_run/
+
+# Weights (empty placeholder, or weight files)
+weights/
+*.nfv1
+*.nfv1.*
+
+# Third party extracted (keep only the archive .zip)
+third_party/openblas/include/
+third_party/openblas/lib/
+third_party/openblas.zip
 
 # Python
 __pycache__/
@@ -34,10 +53,14 @@ Thumbs.db
 *.log
 *.deb
 
-# Data
+# Data dirs (symlinks to external paths, not actual repo content)
 data/unified/
+data_test/
+llm_train/
 
 # Config local overrides
 configs/*.local*
-llm_train/
-data_test/
+
+# Output
+output/
+tok1_data/

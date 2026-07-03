@@ -11,14 +11,14 @@
  * 4. 记忆巩固 (LTP模拟)
  */
 
-#include "tensor.hpp"
-#include "networks.hpp"
-#include <vector>
-#include <memory>
 #include <fstream>
+#include <memory>
+#include <queue>
 #include <string>
 #include <unordered_map>
-#include <queue>
+#include <vector>
+#include "networks.hpp"
+#include "tensor.hpp"
 
 namespace neuroflow {
 

@@ -80,7 +80,7 @@ int main(int argc, char* argv[]) {
     auto stats = model.get_stats();
     std::cerr << "模型参数: " << stats.total_params << " 内存: " << stats.memory_bytes / 1024 / 1024 << " MB" << std::endl;
 
-    std::string tok_path = config_path.substr(0, config_path.find_last_of("/\\")) + "/tokenizer_cn_013.json";
+    std::string tok_path = config_path.substr(0, config_path.find_last_of("/\\") + 1) + "tokenizer_128k.json";
     std::cerr << "加载词表: " << tok_path << std::endl;
     BPETokenizer tokenizer(tok_path);
     size_t vocab_actual = tokenizer.vocab_size();

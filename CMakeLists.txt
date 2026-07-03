@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.14)
-project(neuroflow_core VERSION 1.0.0 LANGUAGES CXX)
+
+option(NEUROFLOW_USE_CUDA "Enable CUDA/cuBLAS backend" OFF)
+
+if(NEUROFLOW_USE_CUDA)
+    project(neuroflow_core VERSION 1.0.0 LANGUAGES CXX CUDA)
+else()
+    project(neuroflow_core VERSION 1.0.0 LANGUAGES CXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +51,27 @@ add_library(neuroflow_core STATIC
     src/weight_io.cpp
 )
 
+if(NEUROFLOW_USE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    if(CUDAToolkit_VERSION VERSION_LESS "11.0")
+        message(FATAL_ERROR "CUDA >= 11.0 required, found ${CUDAToolkit_VERSION}")
+    endif()
+    target_compile_definitions(neuroflow_core PUBLIC USE_CUDA)
+    target_include_directories(neuroflow_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(neuroflow_core PUBLIC CUDA::cudart CUDA::cublas)
+    target_sources(neuroflow_core PRIVATE src/cuda_context.cpp)
+    set_source_files_properties(src/cuda_context.cpp PROPERTIES LANGUAGE CUDA)
+    target_compile_options(neuroflow_core PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_86,code=[sm_86,compute_86]>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+        $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+    )
+    set(NEUROFLOW_CUDA_FOUND TRUE)
+    message(STATUS "CUDA backend enabled: ${CUDAToolkit_VERSION}")
+else()
+    set(NEUROFLOW_CUDA_FOUND FALSE)
+endif()
+
 target_include_directories(neuroflow_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -65,8 +93,18 @@ if(NEUROFLOW_USE_BLAS)
         message(STATUS "External BLAS found: ${BLAS_LIBRARIES}")
         message(STATUS "  NOTE: Set OPENBLAS_NUM_THREADS=1 at runtime to avoid thread oversubscription with OpenMP")
     else()
-        set(NEUROFLOW_BLAS_FOUND FALSE)
-        message(STATUS "External BLAS not found, using built-in GEMM")
+        set(OPENBLAS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openblas")
+        if(EXISTS "${OPENBLAS_DIR}/include/cblas.h" AND EXISTS "${OPENBLAS_DIR}/lib/libscipy_openblas.lib")
+            target_compile_definitions(neuroflow_core PUBLIC USE_CBLAS)
+            target_include_directories(neuroflow_core PUBLIC "${OPENBLAS_DIR}/include")
+            target_link_libraries(neuroflow_core PUBLIC "${OPENBLAS_DIR}/lib/libscipy_openblas.lib")
+            set(NEUROFLOW_BLAS_FOUND TRUE)
+            message(STATUS "Using bundled OpenBLAS from: ${OPENBLAS_DIR}")
+            message(STATUS "  NOTE: Set OPENBLAS_NUM_THREADS=1 at runtime to avoid thread oversubscription with OpenMP")
+        else()
+            set(NEUROFLOW_BLAS_FOUND FALSE)
+            message(STATUS "External BLAS not found, using built-in GEMM")
+        endif()
     endif()
 else()
     set(NEUROFLOW_BLAS_FOUND FALSE)
@@ -80,6 +118,18 @@ add_executable(neuroflow_train_v2 src/train_v2.cpp)
 target_link_libraries(neuroflow_train_v2 PRIVATE neuroflow_core)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(neuroflow_train_v2 PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+add_executable(neuroflow_test_lm tests/test_lm_pathway.cpp)
+target_link_libraries(neuroflow_test_lm PRIVATE neuroflow_core)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(neuroflow_test_lm PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+add_executable(neuroflow_infer_v2 src/infer_v2.cpp)
+target_link_libraries(neuroflow_infer_v2 PRIVATE neuroflow_core)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(neuroflow_infer_v2 PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 if(NEUROFLOW_BUILD_TESTS)
@@ -116,4 +166,5 @@ message(STATUS "  Tests:          ${NEUROFLOW_BUILD_TESTS}")
 message(STATUS "  Python:         ${NEUROFLOW_BUILD_PYTHON}")
 message(STATUS "  OpenMP:         ${OpenMP_CXX_FOUND}")
 message(STATUS "  BLAS:           ${NEUROFLOW_BLAS_FOUND}")
+message(STATUS "  CUDA:           ${NEUROFLOW_CUDA_FOUND}")
 message(STATUS "")

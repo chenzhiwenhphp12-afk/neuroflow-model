@@ -1,38 +1,161 @@
-#ifndef NOMINMAX
+﻿#ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
-#include "neuroflow/model.hpp"
-#include "neuroflow/generative.hpp"
-#include "neuroflow/backprop.hpp"
-#include "neuroflow/online_learning.hpp"
-#include "weight_io.hpp"
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
-#include <vector>
-#include <cmath>
-#include <chrono>
-#include <cstdlib>
-#include <cstring>
-#include <cstdio>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-#include <algorithm>
-#include <numeric>
-#include <filesystem>
+// C 系统头文件
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <fcntl.h>
 #else
 #include <windows.h>
 #endif
 
-using namespace neuroflow;
+// C++ 标准库
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <sstream>
+#include <string>
+#include <vector>
+
+// 第三方库
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// 项目头文件
+#include "neuroflow/backprop.hpp"
+#include "neuroflow/generative.hpp"
+#include "neuroflow/model.hpp"
+#include "neuroflow/online_learning.hpp"
+#include "weight_io.hpp"
+
+using neuroflow::BPETokenizer;
+using neuroflow::CausalLMConfig;
+using neuroflow::CausalLMHead;
+using neuroflow::FullBackpropEngine;
+using neuroflow::InitStrategy;
+using neuroflow::NeuroFlowModel;
+using neuroflow::QuantType;
+using neuroflow::Tensor;
+using neuroflow::WeightInitializer;
+
+namespace {
+
+Tensor lm_linear_backward_input(const Tensor& output_grad, const Tensor& weight) {
+    size_t batch = output_grad.shape_[0];
+    size_t out_f = output_grad.shape_[1];
+    size_t in_f = weight.shape_[1];
+    Tensor input_grad({batch, in_f}, QuantType::FP32);
+
+#ifdef USE_CUDA
+    if (CudaContext::instance().is_available() && output_grad.is_on_gpu()) {
+        input_grad.to_gpu();
+        CudaContext::instance().sgemm_rowmajor(false, false,
+            static_cast<int>(batch), static_cast<int>(in_f), static_cast<int>(out_f),
+            1.0f, output_grad.as_gpu_fp32(), static_cast<int>(out_f),
+            weight.as_gpu_fp32(), static_cast<int>(in_f),
+            0.0f, input_grad.as_gpu_fp32(), static_cast<int>(in_f));
+        input_grad.gpu_dirty_ = true;
+        return input_grad;
+    }
+#endif
+
+    memset(input_grad.as_fp32(), 0, input_grad.data_size_);
+
+    if (out_f > 8192 && batch == 1) {
+        const float* og = output_grad.as_fp32();
+        const float* w = weight.as_fp32();
+        float* ig = input_grad.as_fp32();
+        float threshold = 1e-4f;
+        size_t n_active = 0;
+        for (size_t i = 0; i < out_f; ++i) {
+            if (std::abs(og[i]) >= threshold) n_active++;
+        }
+        if (n_active < out_f / 4) {
+            for (size_t i = 0; i < out_f; ++i) {
+                float g = og[i];
+                if (std::abs(g) < threshold) continue;
+                const float* w_row = w + i * in_f;
+                for (size_t j = 0; j < in_f; ++j) {
+                    ig[j] += g * w_row[j];
+                }
+            }
+            return input_grad;
+        }
+    }
+
+#ifdef USE_CBLAS
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                batch, in_f, out_f,
+                1.0f, output_grad.as_fp32(), out_f, weight.as_fp32(), in_f,
+                0.0f, input_grad.as_fp32(), in_f);
+#else
+    const float* og2 = output_grad.as_fp32();
+    const float* w2 = weight.as_fp32();
+    float* ig2 = input_grad.as_fp32();
+    for (size_t b = 0; b < batch; ++b) {
+        for (size_t j = 0; j < in_f; ++j) {
+            float sum = 0.0f;
+            for (size_t i = 0; i < out_f; ++i) {
+                sum += og2[b * out_f + i] * w2[i * in_f + j];
+            }
+            ig2[b * in_f + j] = sum;
+        }
+    }
+#endif
+    return input_grad;
+}
+
+Tensor lm_linear_backward_weight(const Tensor& input, const Tensor& output_grad) {
+    size_t batch = input.shape_[0];
+    size_t in_f = input.shape_[1];
+    size_t out_f = output_grad.shape_[1];
+    Tensor weight_grad({out_f, in_f}, QuantType::FP32);
+#ifdef USE_CUDA
+    if (CudaContext::instance().is_available() && output_grad.is_on_gpu()) {
+        weight_grad.to_gpu();
+        CudaContext::instance().sgemm_rowmajor(true, false,
+            static_cast<int>(out_f), static_cast<int>(in_f), static_cast<int>(batch),
+            1.0f / batch, output_grad.as_gpu_fp32(), static_cast<int>(out_f),
+            input.as_gpu_fp32(), static_cast<int>(in_f),
+            0.0f, weight_grad.as_gpu_fp32(), static_cast<int>(in_f));
+        weight_grad.gpu_dirty_ = true;
+        return weight_grad;
+    }
+#endif
+#ifdef USE_CBLAS
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                out_f, in_f, batch,
+                1.0f / batch, output_grad.as_fp32(), out_f, input.as_fp32(), in_f,
+                0.0f, weight_grad.as_fp32(), in_f);
+#else
+    const float* inp = input.as_fp32();
+    const float* og = output_grad.as_fp32();
+    float* wg = weight_grad.as_fp32();
+    for (size_t i = 0; i < out_f; ++i) {
+        for (size_t j = 0; j < in_f; ++j) {
+            float sum = 0.0f;
+            for (size_t b = 0; b < batch; ++b) {
+                sum += og[b * out_f + i] * inp[b * in_f + j];
+            }
+            wg[i * in_f + j] = sum / batch;
+        }
+    }
+#endif
+    return weight_grad;
+}
+
+}
 
 struct TrainConfig {
     std::string config_path;
@@ -53,6 +176,8 @@ struct TrainConfig {
     std::string vocab_mask_path = "";
     int replay_buffer_size = 10000;
     float replay_ratio = 0.25f;
+    bool use_cuda = false;
+    bool verbose = false;
 };
 
 TrainConfig parse_args(int argc, char* argv[]) {
@@ -77,6 +202,8 @@ TrainConfig parse_args(int argc, char* argv[]) {
         else if (arg == "--vocab-mask" && i + 1 < argc) cfg.vocab_mask_path = argv[++i];
         else if (arg == "--replay-buffer" && i + 1 < argc) cfg.replay_buffer_size = std::atoi(argv[++i]);
         else if (arg == "--replay-ratio" && i + 1 < argc) cfg.replay_ratio = std::atof(argv[++i]);
+        else if (arg == "--use-cuda") cfg.use_cuda = true;
+        else if (arg == "--verbose") cfg.verbose = true;
     }
     return cfg;
 }
@@ -161,6 +288,9 @@ NeuroFlowModel::Config load_model_config(const std::string& json_path) {
     cfg.vocab_size = extract_json_number(json, "vocab_size", cfg.vocab_size);
     cfg.max_seq_len = extract_json_number(json, "max_seq_len", cfg.max_seq_len);
     cfg.causal_window_size = extract_json_number(json, "causal_window_size", cfg.causal_window_size);
+    cfg.lm_num_attn_layers = extract_json_number(json, "lm_num_attn_layers", cfg.lm_num_attn_layers);
+    cfg.lm_pooling = extract_json_string(json, "lm_pooling");
+    if (cfg.lm_pooling.empty()) cfg.lm_pooling = "mean";
 
     std::cerr << "配置加载: " << json_path << std::endl;
     std::cerr << "  d_model=" << cfg.input_dim << " hidden_dim=" << cfg.hidden_dim
@@ -225,6 +355,87 @@ ResumeState load_checkpoint(NeuroFlowModel& model, const std::string& ckpt_path)
     model.load(model_path);
     state.found = true;
     return state;
+}
+
+bool load_lm_head(CausalLMHead& lm_head, const std::string& lm_path) {
+    std::ifstream ifs(lm_path, std::ios::binary);
+    if (!ifs) {
+        std::cerr << "LM Head checkpoint未找到: " << lm_path << std::endl;
+        return false;
+    }
+
+    char magic[5] = {0};
+    ifs.read(magic, 4);
+    if (std::string(magic) != "LMH2" && std::string(magic) != "LMH1") {
+        std::cerr << "LM Head格式不匹配: " << std::string(magic) << " (期望LMH2/LMH1)" << std::endl;
+        ifs.close();
+        return false;
+    }
+
+    auto read_named_tensor = [&]() -> std::pair<std::string, Tensor> {
+        uint32_t nl = 0; ifs.read((char*)&nl, 4);
+        if (nl == 0 || ifs.eof()) return {"", Tensor()};
+        std::string name(nl, '\0'); ifs.read(&name[0], nl);
+        uint32_t nd = 0; ifs.read((char*)&nd, 4);
+        std::vector<size_t> shape(nd);
+        for (size_t i = 0; i < nd; ++i) { uint32_t d = 0; ifs.read((char*)&d, 4); shape[i] = d; }
+        uint32_t ds = 0; ifs.read((char*)&ds, 4);
+        Tensor t(shape, QuantType::FP32);
+        if (t.data_size_ == ds) {
+            ifs.read((char*)t.data_.get(), ds);
+        } else {
+            ifs.seekg(ds, std::ios::cur);
+            t = Tensor();
+        }
+        return {name, std::move(t)};
+    };
+
+    std::unordered_map<std::string, Tensor*> tensor_map;
+    tensor_map["w_embed"] = &lm_head.w_embed_;
+    tensor_map["w_pos"] = &lm_head.w_pos_;
+    tensor_map["dw_kernel"] = &lm_head.dw_kernel_;
+    tensor_map["pw_conv.weight"] = &lm_head.pw_conv_->weight;
+    tensor_map["sae_encode.weight"] = &lm_head.sae_w_encode_->weight;
+    tensor_map["sae_decode.weight"] = &lm_head.sae_w_decode_->weight;
+    tensor_map["ntm_read.weight"] = &lm_head.ntm_w_read_->weight;
+    tensor_map["ntm_write.weight"] = &lm_head.ntm_w_write_->weight;
+    tensor_map["ntm_erase.weight"] = &lm_head.ntm_w_erase_->weight;
+    tensor_map["ntm_memory"] = &lm_head.ntm_memory_;
+    tensor_map["w_proj.weight"] = &lm_head.w_proj_->weight;
+    tensor_map["w_proj.bias"] = &lm_head.w_proj_->bias;
+    tensor_map["w_out.weight"] = &lm_head.w_out_->weight;
+    tensor_map["w_out.bias"] = &lm_head.w_out_->bias;
+    tensor_map["ln.weight"] = &lm_head.ln_->weight;
+    tensor_map["ln.bias"] = &lm_head.ln_->bias;
+    for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
+        std::string p = "attn" + std::to_string(i) + ".";
+        tensor_map[p + "w_qkv.weight"] = &lm_head.attn_layers_[i]->w_qkv->weight;
+        tensor_map[p + "w_qkv.bias"] = &lm_head.attn_layers_[i]->w_qkv->bias;
+        tensor_map[p + "w_out.weight"] = &lm_head.attn_layers_[i]->w_out->weight;
+        tensor_map[p + "w_out.bias"] = &lm_head.attn_layers_[i]->w_out->bias;
+        tensor_map[p + "norm.weight"] = &lm_head.attn_layers_[i]->norm->weight;
+        tensor_map[p + "norm.bias"] = &lm_head.attn_layers_[i]->norm->bias;
+    }
+
+    size_t loaded = 0;
+    while (ifs) {
+        auto [name, tensor] = read_named_tensor();
+        if (name.empty()) break;
+        auto it = tensor_map.find(name);
+        if (it != tensor_map.end() && tensor.numel() > 0) {
+            if (it->second->shape_ == tensor.shape_) {
+                memcpy(it->second->data_.get(), tensor.data_.get(), tensor.data_size_);
+                loaded++;
+            } else {
+                std::cerr << "  跳过 '" << name << "': 形状不匹配" << std::endl;
+            }
+        }
+    }
+
+    ifs.close();
+    if (lm_head.config_.weight_tying) lm_head.tie_weights();
+    std::cerr << "LM Head已恢复: " << loaded << " 个张量从 " << lm_path << std::endl;
+    return loaded > 0;
 }
 
 NeuroFlowModel build_model(const NeuroFlowModel::Config& cfg, const TrainConfig& train_cfg,
@@ -989,7 +1200,7 @@ void save_checkpoint(const NeuroFlowModel& model, const TrainMetrics& metrics,
  pid_t pid = fork();
  if (pid == 0) {
  // 子进程: 拷贝后退出
- execlp("cp", "cp", "-r", shm_dir.c_str(), ckpt_dir.c_str(), (char*)nullptr);
+ execlp("cp", "cp", "-r", shm_dir.c_str(), ckpt_dir.c_str(),  static_cast<char*>(nullptr));
  _exit(1); // execlp失败
  }
  // 父进程不等待, 继续训练
@@ -1013,45 +1224,100 @@ std::unique_ptr<BPETokenizer> load_tokenizer(const std::string& tokenizer_path) 
     return tok;
 }
 
-void train_loop(NeuroFlowModel& model, DataLoader& loader, MetricsLogger& logger,
+void train_loop(NeuroFlowModel& model, CausalLMHead& lm_head, DataLoader& loader, MetricsLogger& logger,
                 const TrainConfig& cfg, const ResumeState& resume_state,
                 const std::vector<uint8_t>& vocab_mask = {}) {
 #ifdef _OPENMP
     int max_threads = omp_get_max_threads();
     std::cerr << "OpenMP最大线程数: " << max_threads << std::endl;
-    std::cerr << "建议: 若双路Xeon，用 numactl --cpunodebind=0 --membind=0 绑定NUMA节点" << std::endl;
 #else
     std::cerr << "警告: 未启用OpenMP，非GEMM运算为单线程" << std::endl;
 #endif
 
-    FullTrainer trainer(model, cfg.learning_rate);
-    int accum_steps = std::max(1, cfg.grad_accum_steps);
-    if (accum_steps > 1) {
-        std::cerr << "梯度累积: 每" << accum_steps << "步更新一次参数 (等效batch="
-                  << cfg.batch_size * accum_steps << ")" << std::endl;
-    }
+    size_t vocab_sz = lm_head.config_.vocab_size;
+    size_t d_model = lm_head.config_.d_model;
+    float learning_rate = cfg.learning_rate;
+
+    std::cerr << "训练模式: CausalLMHead完整forward (embed→PE→Attn×"
+              << lm_head.config_.num_attn_layers << "→Gate→SAE→NTM→LN→Pool→Proj→Out)" << std::endl;
+    std::cerr << "  d_model=" << d_model << " vocab=" << vocab_sz
+              << " pooling=" << lm_head.config_.pooling << std::endl;
 
     std::vector<float> epoch_losses;
     int start_epoch = resume_state.found ? resume_state.epoch : 0;
     size_t start_step = resume_state.found ? resume_state.step : 0;
 
-    struct ReplaySample {
-        std::vector<float> input;
-        std::vector<float> target;
-    };
-    std::vector<ReplaySample> replay_buffer;
-    replay_buffer.reserve(cfg.replay_buffer_size);
-    size_t replay_pos = 0;
-    std::mt19937 replay_rng(cfg.seed + 999);
-    if (cfg.replay_buffer_size > 0 && cfg.replay_ratio > 0.0f) {
-        std::cerr << "经验回放: 缓冲区=" << cfg.replay_buffer_size
-                  << " 回放比=" << cfg.replay_ratio << std::endl;
-    }
-
     if (start_epoch > 0) {
         std::cerr << "续训: 从epoch " << start_epoch + 1 << " 开始, 已完成 "
                   << start_step << " 步" << std::endl;
     }
+
+    auto save_lm_head = [&](const std::string& path) {
+#ifdef USE_CUDA
+        auto sync_to_cpu = [](const Tensor& t) {
+            if (t.is_on_gpu()) { const_cast<Tensor&>(t).to_cpu(); }
+        };
+        sync_to_cpu(lm_head.w_embed_);
+        sync_to_cpu(lm_head.w_pos_);
+        sync_to_cpu(lm_head.dw_kernel_);
+        sync_to_cpu(lm_head.pw_conv_->weight);
+        sync_to_cpu(lm_head.sae_w_encode_->weight);
+        sync_to_cpu(lm_head.sae_w_decode_->weight);
+        sync_to_cpu(lm_head.ntm_w_read_->weight);
+        sync_to_cpu(lm_head.ntm_w_write_->weight);
+        sync_to_cpu(lm_head.ntm_w_erase_->weight);
+        sync_to_cpu(lm_head.ntm_memory_);
+        sync_to_cpu(lm_head.w_proj_->weight);
+        sync_to_cpu(lm_head.w_proj_->bias);
+        sync_to_cpu(lm_head.w_out_->weight);
+        sync_to_cpu(lm_head.w_out_->bias);
+        sync_to_cpu(lm_head.ln_->weight);
+        sync_to_cpu(lm_head.ln_->bias);
+        for (auto& attn : lm_head.attn_layers_) {
+            sync_to_cpu(attn->w_qkv->weight);
+            sync_to_cpu(attn->w_qkv->bias);
+            sync_to_cpu(attn->w_out->weight);
+            sync_to_cpu(attn->w_out->bias);
+            sync_to_cpu(attn->norm->weight);
+            sync_to_cpu(attn->norm->bias);
+        }
+#endif
+        auto sl = [](std::ofstream& o, const std::string& n, const Tensor& t) {
+            uint32_t nl = n.size(); o.write((char*)&nl, 4); o.write(n.data(), nl);
+            uint32_t nd = t.shape_.size(); o.write((char*)&nd, 4);
+            for (auto d : t.shape_) { uint32_t dd = d; o.write((char*)&dd, 4); }
+            uint32_t ds = t.data_size_; o.write((char*)&ds, 4);
+            o.write((char*)t.data_.get(), ds);
+        };
+        std::ofstream o(path, std::ios::binary);
+        o.write("LMH2", 4);
+        sl(o, "w_embed", lm_head.w_embed_);
+        sl(o, "w_pos", lm_head.w_pos_);
+        sl(o, "dw_kernel", lm_head.dw_kernel_);
+        sl(o, "pw_conv.weight", lm_head.pw_conv_->weight);
+        sl(o, "sae_encode.weight", lm_head.sae_w_encode_->weight);
+        sl(o, "sae_decode.weight", lm_head.sae_w_decode_->weight);
+        sl(o, "ntm_read.weight", lm_head.ntm_w_read_->weight);
+        sl(o, "ntm_write.weight", lm_head.ntm_w_write_->weight);
+        sl(o, "ntm_erase.weight", lm_head.ntm_w_erase_->weight);
+        sl(o, "ntm_memory", lm_head.ntm_memory_);
+        sl(o, "w_proj.weight", lm_head.w_proj_->weight);
+        sl(o, "w_proj.bias", lm_head.w_proj_->bias);
+        sl(o, "w_out.weight", lm_head.w_out_->weight);
+        if (lm_head.w_out_->bias.data_) sl(o, "w_out.bias", lm_head.w_out_->bias);
+        sl(o, "ln.weight", lm_head.ln_->weight);
+        sl(o, "ln.bias", lm_head.ln_->bias);
+        for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
+            std::string p = "attn" + std::to_string(i) + ".";
+            sl(o, p + "w_qkv.weight", lm_head.attn_layers_[i]->w_qkv->weight);
+            sl(o, p + "w_qkv.bias", lm_head.attn_layers_[i]->w_qkv->bias);
+            sl(o, p + "w_out.weight", lm_head.attn_layers_[i]->w_out->weight);
+            sl(o, p + "w_out.bias", lm_head.attn_layers_[i]->w_out->bias);
+            sl(o, p + "norm.weight", lm_head.attn_layers_[i]->norm->weight);
+            sl(o, p + "norm.bias", lm_head.attn_layers_[i]->norm->bias);
+        }
+        uint32_t z = 0; o.write((char*)&z, 4); o.close();
+    };
 
     for (int epoch = start_epoch; epoch < cfg.epochs; ++epoch) {
         auto epoch_start = std::chrono::steady_clock::now();
@@ -1060,98 +1326,120 @@ void train_loop(NeuroFlowModel& model, DataLoader& loader, MetricsLogger& logger
         loader.shuffle(shuffle_rng);
         float epoch_loss = 0.0f;
         size_t step_count = 0;
-        size_t global_step = epoch * ((loader.total_samples() + cfg.batch_size - 1) / cfg.batch_size);
+        size_t global_step = start_step + epoch * ((loader.total_samples() + cfg.batch_size - 1) / cfg.batch_size);
 
         while (loader.has_next()) {
-            auto batch = loader.next_batch();
+            auto batch = loader.next_lm_batch_raw();
             if (batch.empty()) break;
 
-            size_t actual_batch = batch.size();
-            Tensor input({actual_batch, model.config.input_dim}, QuantType::FP32);
-            Tensor target({actual_batch, model.config.output_dim}, QuantType::FP32);
+            float batch_loss = 0.0f;
+            float batch_grad_norm = 0.0f;
+            size_t batch_count = 0;
 
-            float* inp = input.as_fp32();
-            float* tgt = target.as_fp32();
+            for (auto& sample : batch) {
+                if (sample.token_ids.size() < 2) continue;
 
-            for (size_t b = 0; b < actual_batch; ++b) {
-                size_t copy_in = std::min(batch[b].input.size(), model.config.input_dim);
-                size_t copy_out = std::min(batch[b].target.size(), model.config.output_dim);
-                for (size_t j = 0; j < copy_in; ++j) inp[b * model.config.input_dim + j] = batch[b].input[j];
-                for (size_t j = copy_in; j < model.config.input_dim; ++j) inp[b * model.config.input_dim + j] = 0.0f;
-                for (size_t j = 0; j < copy_out; ++j) tgt[b * model.config.output_dim + j] = batch[b].target[j];
-                for (size_t j = copy_out; j < model.config.output_dim; ++j) tgt[b * model.config.output_dim + j] = 0.0f;
+                std::vector<size_t> input_ids(sample.token_ids.begin(), sample.token_ids.end() - 1);
+                size_t target_id = sample.token_ids.back();
+                if (target_id >= vocab_sz) target_id = 1;
 
-                if (cfg.replay_buffer_size > 0) {
-                    ReplaySample rs;
-                    rs.input.assign(inp + b * model.config.input_dim, inp + (b + 1) * model.config.input_dim);
-                    rs.target.assign(tgt + b * model.config.output_dim, tgt + (b + 1) * model.config.output_dim);
-                    if (replay_buffer.size() < static_cast<size_t>(cfg.replay_buffer_size)) {
-                        replay_buffer.push_back(std::move(rs));
-                    } else {
-                        replay_buffer[replay_pos % replay_buffer.size()] = std::move(rs);
-                        replay_pos++;
+                Tensor logits = lm_head.forward_for_training(input_ids);
+
+                float loss = 0.0f;
+                float grad_norm = 0.0f;
+                Tensor logits_grad({1, vocab_sz}, QuantType::FP32);
+
+#ifdef USE_CUDA
+                if (cfg.use_cuda && logits.is_on_gpu()) {
+                    logits_grad.to_gpu();
+                    launch_cross_entropy_backward(logits_grad.as_gpu_fp32(), logits.as_gpu_fp32(),
+                        static_cast<int>(target_id), static_cast<int>(vocab_sz), CudaContext::instance().stream());
+                    logits_grad.gpu_dirty_ = true;
+
+                    Tensor d_loss({1}, QuantType::FP32);
+                    d_loss.to_gpu();
+                    launch_cross_entropy(d_loss.as_gpu_fp32(), logits.as_gpu_fp32(),
+                        static_cast<int>(target_id), static_cast<int>(vocab_sz), CudaContext::instance().stream());
+                    CudaContext::instance().synchronize();
+                    float loss_arr[1];
+                    CudaContext::instance().copy_d2h(loss_arr, d_loss.as_gpu_fp32(), sizeof(float));
+                    CudaContext::instance().synchronize();
+                    loss = loss_arr[0];
+
+                    if (!std::isfinite(loss)) {
+                        std::cerr << "[WARN] NaN loss at step " << global_step << ", skipping" << std::endl;
+                        continue;
+                    }
+
+                    grad_norm = 0.0f;
+                } else
+#endif
+                {
+                    const float* pred = logits.as_fp32();
+                    float max_val = -1e30f;
+                    for (size_t j = 0; j < vocab_sz; ++j) {
+                        if (pred[j] > max_val) max_val = pred[j];
+                    }
+                    float sum_exp = 0.0f;
+                    for (size_t j = 0; j < vocab_sz; ++j) {
+                        sum_exp += std::exp(pred[j] - max_val);
+                    }
+                    float log_sum_exp = max_val + std::log(sum_exp);
+                    loss = -(pred[target_id] - log_sum_exp);
+
+                    if (!std::isfinite(loss)) {
+                        std::cerr << "[WARN] NaN loss at step " << global_step << ", skipping" << std::endl;
+                        continue;
+                    }
+
+                    float* lg = logits_grad.as_fp32();
+                    for (size_t j = 0; j < vocab_sz; ++j) {
+                        float softmax_val = std::exp(pred[j] - max_val) / sum_exp;
+                        lg[j] = softmax_val;
+                        if (j == target_id) lg[j] -= 1.0f;
+                        grad_norm += lg[j] * lg[j];
                     }
                 }
+
+                auto lm_grads = lm_head.backward_from_logits(logits_grad);
+
+                float clip_val = cfg.grad_clip;
+                float gn = std::sqrt(grad_norm);
+                float clip_scale = 1.0f;
+                if (!std::isfinite(gn) || gn > clip_val && clip_val > 0.0f) {
+                    clip_scale = clip_val / gn;
+                }
+
+                lm_head.apply_lm_gradients(lm_grads, learning_rate * clip_scale);
+
+
+                batch_loss += loss;
+                batch_grad_norm += grad_norm;
+                batch_count++;
             }
 
-            if (!replay_buffer.empty() && cfg.replay_ratio > 0.0f) {
-                size_t n_replay = static_cast<size_t>(actual_batch * cfg.replay_ratio);
-                if (n_replay > 0 && n_replay <= actual_batch && replay_buffer.size() >= n_replay) {
-                    std::uniform_int_distribution<size_t> rdist(0, replay_buffer.size() - 1);
-                    for (size_t r = 0; r < n_replay; ++r) {
-                        size_t idx = rdist(replay_rng);
-                        size_t b = actual_batch - n_replay + r;
-                        const auto& rs = replay_buffer[idx];
-                        size_t copy_in = std::min(rs.input.size(), static_cast<size_t>(model.config.input_dim));
-                        size_t copy_out = std::min(rs.target.size(), static_cast<size_t>(model.config.output_dim));
-                        for (size_t j = 0; j < copy_in; ++j) inp[b * model.config.input_dim + j] = rs.input[j];
-                        for (size_t j = copy_in; j < model.config.input_dim; ++j) inp[b * model.config.input_dim + j] = 0.0f;
-                        for (size_t j = 0; j < copy_out; ++j) tgt[b * model.config.output_dim + j] = rs.target[j];
-                        for (size_t j = copy_out; j < model.config.output_dim; ++j) tgt[b * model.config.output_dim + j] = 0.0f;
-                    }
+            if (batch_count > 0) {
+                epoch_loss += batch_loss / batch_count;
+                step_count++;
+                global_step++;
+
+                TrainMetrics metrics;
+                metrics.loss = batch_loss / batch_count;
+                metrics.lr = cfg.learning_rate;
+                metrics.step = global_step;
+                metrics.epoch = epoch + 1;
+                metrics.grad_norm = std::sqrt(batch_grad_norm / batch_count);
+                metrics.elapsed_seconds = static_cast<float>(logger.total_elapsed());
+                logger.log_step(metrics, cfg.log_interval);
+
+                if (cfg.save_interval > 0 && global_step % cfg.save_interval == 0) {
+                    std::string cdir = cfg.output_dir + "/checkpoint_step" + std::to_string(global_step);
+                    ensure_dir_exists(cdir);
+                    model.save(cdir + "/model.nfv1");
+                    save_lm_head(cdir + "/lm_head.nfv1");
+                    std::cerr << "Checkpoint: step=" << global_step << " loss=" << metrics.loss << std::endl;
                 }
             }
-
-            auto step_result = (accum_steps > 1)
-                ? trainer.accumulate_step(input, target)
-                : trainer.train_step(input, target);
-
-            epoch_loss += step_result.loss;
-            step_count++;
-            global_step++;
-
-            if (accum_steps > 1 && step_count % accum_steps == 0) {
-                trainer.apply_accumulated_gradients(accum_steps);
-            }
-
-            if (!vocab_mask.empty()) {
-                float* ow = model.output_fusion_up->weight.as_fp32();
-                size_t bn_dim = model.config.fusion_bottleneck_dim;
-                size_t out_dim = model.config.output_dim;
-                size_t mask_size = std::min(vocab_mask.size(), out_dim);
-                for (size_t t = 0; t < mask_size; ++t) {
-                    if (vocab_mask[t] == 0) {
-                        memset(ow + t * bn_dim, 0, bn_dim * sizeof(float));
-                    }
-                }
-            }
-
-            TrainMetrics metrics;
-            metrics.loss = step_result.loss;
-            metrics.lr = cfg.learning_rate;
-            metrics.step = global_step;
-            metrics.epoch = epoch + 1;
-            metrics.grad_norm = step_result.grad_norm;
-            metrics.elapsed_seconds = static_cast<float>(logger.total_elapsed());
-            logger.log_step(metrics, cfg.log_interval);
-
-            if (cfg.save_interval > 0 && global_step % cfg.save_interval == 0) {
-                save_checkpoint(model, metrics, cfg.output_dir, global_step, epoch + 1, cfg);
-            }
-        }
-
-        if (accum_steps > 1 && step_count % accum_steps != 0) {
-            trainer.apply_accumulated_gradients(step_count % accum_steps);
         }
 
         float avg_loss = (step_count > 0) ? epoch_loss / step_count : 0.0f;
@@ -1162,11 +1450,15 @@ void train_loop(NeuroFlowModel& model, DataLoader& loader, MetricsLogger& logger
             std::chrono::duration<double>(epoch_end - epoch_start).count());
         logger.log_epoch(epoch + 1, avg_loss, epoch_elapsed);
 
-        save_checkpoint(model, {avg_loss, cfg.learning_rate, global_step, epoch + 1, epoch_elapsed, 0.0f},
-                       cfg.output_dir, global_step, epoch + 1, cfg);
+        std::string cdir = cfg.output_dir + "/checkpoint_epoch" + std::to_string(epoch + 1);
+        ensure_dir_exists(cdir);
+        model.save(cdir + "/model.nfv1");
+        save_lm_head(cdir + "/lm_head.nfv1");
     }
 
     logger.save_training_log(cfg.output_dir + "/training_log.json", epoch_losses);
+    save_lm_head(cfg.output_dir + "/lm_head_final.nfv1");
+    std::cerr << "训练完成, LM Head已保存: " << cfg.output_dir << "/lm_head_final.nfv1" << std::endl;
 }
 
 int main(int argc, char* argv[]) {
@@ -1203,7 +1495,8 @@ int main(int argc, char* argv[]) {
                   << " [--data <data>] [--output <dir>] [--epochs <N>] [--lr <lr>]"
                   << " [--seed <N>] [--resume <path>] [--init-weights <strategy>]"
                   << " [--batch-size <N>] [--log-interval <N>] [--save-interval <N>]"
-                  << " [--grad-clip <val>] [--adam] [--grad-accum <N>]" << std::endl;
+                  << " [--grad-clip <val>] [--adam] [--grad-accum <N>]"
+                  << " [--use-cuda] [--verbose]" << std::endl;
         return 1;
     }
 
@@ -1219,6 +1512,26 @@ int main(int argc, char* argv[]) {
               << " GradAccum: " << cfg.grad_accum_steps
               << " (等效batch=" << cfg.batch_size * cfg.grad_accum_steps << ")" << std::endl;
 
+#ifdef USE_CUDA
+    bool cuda_active = false;
+    if (cfg.use_cuda) {
+        if (CudaContext::instance().initialize(0)) {
+            cuda_active = true;
+            std::cerr << "GPU后端: 已启用 (RTX 3090)" << std::endl;
+        } else {
+            std::cerr << "[CUDA WARNING] GPU初始化失败，回退CPU后端" << std::endl;
+            cfg.use_cuda = false;
+        }
+    } else {
+        std::cerr << "GPU后端: 未启用 (使用--use-cuda启用)" << std::endl;
+    }
+#else
+    if (cfg.use_cuda) {
+        std::cerr << "[CUDA WARNING] 编译时未启用CUDA支持 (NEUROFLOW_USE_CUDA=OFF)，回退CPU后端" << std::endl;
+        cfg.use_cuda = false;
+    }
+#endif
+
     auto model_cfg = load_model_config(cfg.config_path);
     ensure_dir_exists(cfg.output_dir);
     ResumeState resume_state;
@@ -1228,7 +1541,74 @@ int main(int argc, char* argv[]) {
     auto stats = model.get_stats();
     std::cerr << "模型参数: " << stats.total_params << " 内存: " << stats.memory_bytes << " bytes" << std::endl;
 
-    DataLoader loader(cfg.data_path, cfg.batch_size, model_cfg.input_dim, model_cfg.output_dim,
+    CausalLMConfig lm_cfg;
+    lm_cfg.vocab_size = model_cfg.vocab_size;
+    lm_cfg.d_model = model_cfg.hidden_dim;
+    lm_cfg.max_seq_len = model_cfg.max_seq_len;
+    lm_cfg.causal_window_size = model_cfg.causal_window_size;
+    lm_cfg.sae_k = model_cfg.sae_k;
+    lm_cfg.ntm_memory_slots = model_cfg.ntm_memory_slots;
+    lm_cfg.use_mla = model_cfg.use_mla;
+    lm_cfg.mla_latent_dim = model_cfg.mla_latent_dim;
+    lm_cfg.mla_n_heads = model_cfg.mla_n_heads;
+    lm_cfg.mla_max_cache_len = 4096;
+    lm_cfg.weight_tying = true;
+    lm_cfg.num_attn_layers = model_cfg.lm_num_attn_layers;
+    lm_cfg.num_attn_heads = 4;
+    lm_cfg.pooling = model_cfg.lm_pooling;
+    CausalLMHead lm_head(lm_cfg);
+    if (lm_cfg.weight_tying) lm_head.tie_weights();
+    if (!cfg.resume_path.empty()) {
+        std::string lm_ckpt_path;
+        if (cfg.resume_path.size() >= 5 && cfg.resume_path.substr(cfg.resume_path.size() - 5) == ".nfv1") {
+            std::string dir = cfg.resume_path.substr(0, cfg.resume_path.find_last_of("/\\"));
+            lm_ckpt_path = dir + "/lm_head.nfv1";
+        } else {
+            lm_ckpt_path = cfg.resume_path + "/lm_head.nfv1";
+        }
+        load_lm_head(lm_head, lm_ckpt_path);
+    }
+    std::cerr << "CausalLMHead: d_model=" << lm_cfg.d_model
+              << " vocab=" << lm_cfg.vocab_size
+              << " attn_layers=" << lm_cfg.num_attn_layers
+              << " pooling=" << lm_cfg.pooling << std::endl;
+
+#ifdef USE_CUDA
+    if (cfg.use_cuda && cuda_active) {
+        std::cerr << "传输模型参数到GPU..." << std::endl;
+        lm_head.w_embed_.to_gpu();
+        lm_head.w_pos_.to_gpu();
+        lm_head.dw_kernel_.to_gpu();
+        lm_head.pw_conv_->weight.to_gpu();
+        lm_head.sae_w_encode_->weight.to_gpu();
+        lm_head.sae_w_decode_->weight.to_gpu();
+        lm_head.ntm_w_read_->weight.to_gpu();
+        lm_head.ntm_w_write_->weight.to_gpu();
+        lm_head.ntm_w_erase_->weight.to_gpu();
+        lm_head.ntm_memory_.to_gpu();
+        lm_head.w_proj_->weight.to_gpu();
+        lm_head.w_proj_->bias.to_gpu();
+        lm_head.w_out_->weight.to_gpu();
+        if (lm_head.w_out_->bias.data_) lm_head.w_out_->bias.to_gpu();
+        lm_head.ln_->weight.to_gpu();
+        lm_head.ln_->bias.to_gpu();
+        for (auto& attn : lm_head.attn_layers_) {
+            attn->w_qkv->weight.to_gpu();
+            attn->w_qkv->bias.to_gpu();
+            attn->w_out->weight.to_gpu();
+            attn->w_out->bias.to_gpu();
+            attn->norm->weight.to_gpu();
+            attn->norm->bias.to_gpu();
+        }
+        CudaContext::instance().synchronize();
+        size_t free_mem = CudaContext::instance().free_memory();
+        size_t total_mem = CudaContext::instance().total_memory();
+        std::cerr << "GPU显存: " << (total_mem - free_mem) / (1024*1024)
+                  << " MB 已用 / " << total_mem / (1024*1024) << " MB 总计" << std::endl;
+    }
+#endif
+
+    DataLoader loader(cfg.data_path, cfg.batch_size, model_cfg.input_dim, model_cfg.vocab_size,
                       DataLoader::Mode::LM, tokenizer.get(), model_cfg.max_seq_len,
                       500000, 4096);
     std::cerr << "DataLoader内存预算: 4096 MB, 采样上限: 500000" << std::endl;
@@ -1264,10 +1644,10 @@ int main(int argc, char* argv[]) {
 
     MetricsLogger metrics_logger;
 
-    train_loop(model, loader, metrics_logger, cfg, resume_state, vocab_mask);
+    train_loop(model, lm_head, loader, metrics_logger, cfg, resume_state, vocab_mask);
 
     model.save(cfg.output_dir + "/model_final.nfv1");
-    std::cerr << "训练完成，模型已保存到 " << cfg.output_dir << "/model_final.nfv1" << std::endl;
+    std::cerr << "NF模型已保存: " << cfg.output_dir << "/model_final.nfv1" << std::endl;
 
     return 0;
 }

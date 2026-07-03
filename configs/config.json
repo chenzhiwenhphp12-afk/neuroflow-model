@@ -1,7 +1,7 @@
 {
  "input_dim": 512,
  "hidden_dim": 2048,
- "output_dim": 128000,
+ "output_dim": 2048,
  "memory_dim": 512,
  "memory_slots": 64,
  "num_layers": 12,
@@ -18,11 +18,13 @@
  "d_model": 512,
  "mla_n_heads": 8,
  "mla_max_cache_len": 4096,
+ "lm_num_attn_layers": 2,
+ "lm_pooling": "mean",
  "_comment": {
   "input_dim": "输入维度(d_model)",
   "hidden_dim": "隐藏层维度(FFN)",
-  "output_dim": "输出维度(=实际词表大小)",
-  "memory_dim": "记忆维度(d_mem)",
+   "output_dim": "三脑内部输出维度(=hidden_dim, 非vocab_size)",
+   "memory_dim": "记忆维度(d_mem)",
   "memory_slots": "记忆槽数(MEM_SLOTS)",
   "num_layers": "网络层数(ECN层)",
   "num_associations": "DMN关联头数",
@@ -37,7 +39,9 @@
   "ntm_memory_slots": "NTM记忆槽数",
   "d_model": "模型维度(512)",
   "mla_n_heads": "MLA头数",
-  "mla_max_cache_len": "MLA最大缓存长度"
+   "mla_max_cache_len": "MLA最大缓存长度",
+   "lm_num_attn_layers": "CausalLM注意力层数(2-4)",
+   "lm_pooling": "池化方式(mean/last)"
  },
   "_fix_log": "2026-06-13: 128K BPE tokenizer (train_128k_tokenizer.py)"
 }

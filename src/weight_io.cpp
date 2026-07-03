@@ -95,7 +95,7 @@ void WeightInitializer::init_model_weights(NeuroFlowModel& model, InitStrategy s
     init_linear(model.ecn->ofc2, half, 1);
     // vmPFC: hidden_dim -> half -> output_dim
     init_linear(model.ecn->vmpfc1, cfg.hidden_dim, half);
-    init_linear(model.ecn->vmpfc2, half, cfg.output_dim);
+    init_linear(model.ecn->vmpfc2, half, cfg.hidden_dim);
 
     // === DMN (Default Mode Network) ===
     // mem_encoder: memory_dim -> latent_dim*2 -> latent_dim
@@ -133,10 +133,10 @@ void WeightInitializer::init_model_weights(NeuroFlowModel& model, InitStrategy s
     init_linear(model.manifold_proj2, cfg.hidden_dim, 32);
 
     // === Output Fusion (低秩因式分解) ===
-    size_t fusion_in = cfg.output_dim * 3;
+    size_t fusion_in = cfg.hidden_dim * 3;
     size_t bn = cfg.fusion_bottleneck_dim;
     init_linear(model.output_fusion_down, fusion_in, bn);
-    init_linear(model.output_fusion_up, bn, cfg.output_dim);
+    init_linear(model.output_fusion_up, bn, cfg.hidden_dim);
 }
 
 ValidationResult WeightInitializer::validate_dimensions(const NeuroFlowModel& model) {
@@ -175,7 +175,7 @@ ValidationResult WeightInitializer::validate_dimensions(const NeuroFlowModel& mo
     check2d("ecn.ofc1.weight", model.ecn->ofc1->weight, half, cfg.hidden_dim);
     check2d("ecn.ofc2.weight", model.ecn->ofc2->weight, 1, half);
     check2d("ecn.vmpfc1.weight", model.ecn->vmpfc1->weight, half, cfg.hidden_dim);
-    check2d("ecn.vmpfc2.weight", model.ecn->vmpfc2->weight, cfg.output_dim, half);
+    check2d("ecn.vmpfc2.weight", model.ecn->vmpfc2->weight, cfg.hidden_dim, half);
 
     // DMN
     check2d("dmn.mem_encoder1.weight", model.dmn->mem_encoder1->weight, latent_dim * 2, cfg.memory_dim);
@@ -209,10 +209,10 @@ ValidationResult WeightInitializer::validate_dimensions(const NeuroFlowModel& mo
 
     // Output Fusion (低秩因式分解)
     size_t bn = cfg.fusion_bottleneck_dim;
-    check2d("output_fusion.down.weight", model.output_fusion_down->weight, bn, cfg.output_dim * 3);
+    check2d("output_fusion.down.weight", model.output_fusion_down->weight, bn, cfg.hidden_dim * 3);
     check1d("output_fusion.down.bias", model.output_fusion_down->bias, bn);
-    check2d("output_fusion.up.weight", model.output_fusion_up->weight, cfg.output_dim, bn);
-    check1d("output_fusion.up.bias", model.output_fusion_up->bias, cfg.output_dim);
+    check2d("output_fusion.up.weight", model.output_fusion_up->weight, cfg.hidden_dim, bn);
+    check1d("output_fusion.up.bias", model.output_fusion_up->bias, cfg.hidden_dim);
 
     return result;
 }

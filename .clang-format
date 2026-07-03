@@ -1,0 +1,98 @@
+# NeuroFlow C++ 代码风格配置
+# 基于 Google C++ Style Guide (C++20)
+#
+# 用法:
+#   clang-format -i <file.cpp>          # 就地格式化
+#   clang-format --dry-run <file.cpp>   # 检查而不修改
+#   find src/ include/ -name '*.cpp' -o -name '*.hpp' | xargs clang-format -i
+
+---
+BasedOnStyle: Google
+
+Language: Cpp
+Standard: c++20
+
+# ──── 缩进与空格 ────
+IndentWidth: 4
+UseTab: Never
+TabWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4          # public:/private: 左移1个缩进
+
+# ──── 行宽与换行 ────
+ColumnLimit: 100                   # Google推荐80，NeuroFlow用100（模板/长类型名）
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+
+# ──── 空行 ────
+MaxEmptyLinesToKeep: 1
+SeparateDefinitionBlocks: Always
+
+# ──── Include 排序 ────
+# Google 要求的5层分组:
+#   1. 关联头文件 (.hpp)
+#   2. C 系统头
+#   3. C++ 标准库头
+#   4. 第三方库头
+#   5. 项目头
+SortIncludes: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  # 关联头文件 (对应 .cpp 的同名 .hpp)
+  - Regex: '^".*\.hpp"$'
+    Priority: 1
+  # C 系统头
+  - Regex: '^<.*\.h>$'
+    Priority: 2
+  # C++ 标准库
+  - Regex: '^<(algorithm|chrono|cmath|cstdint|cstdio|cstdlib|cstring|exception|filesystem|fstream|functional|iostream|memory|numeric|random|sstream|stdexcept|string|thread|unordered_map|utility|vector)>$'
+    Priority: 3
+  # POSIX / 平台头
+  - Regex: '^<(fcntl|sys/|unistd|windows|omp)'
+    Priority: 4
+  # CBLAS
+  - Regex: '^<cblas\.h>$'
+    Priority: 4
+  # 第三方库 / 项目内部
+  - Regex: '^"(neuroflow|weight_io)/'
+    Priority: 5
+  - Regex: '.*'
+    Priority: 6
+
+# ──── 指针对齐 ────
+DerivePointerAlignment: false
+PointerAlignment: Left              # int* p (类型对齐)
+
+# ──── 空格 ────
+SpaceAfterCStyleCast: true
+SpaceBeforeAssignmentOperators: true
+SpaceBeforeCpp11BracedList: false
+SpacesInAngles: false               # vector<int> 而非 vector< int >
+SpacesInCStyleCastParentheses: false
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+
+# ──── 大括号 ────
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+  AfterExternBlock: false
+
+# ──── 函数声明 ────
+AlwaysBreakAfterReturnType: None
+AlwaysBreakTemplateDeclarations: false
+
+# ──── 其他 ────
+ReflowComments: false               # 不自动重排注释（含中文）
+FixNamespaceComments: true          # }  // namespace neuroflow

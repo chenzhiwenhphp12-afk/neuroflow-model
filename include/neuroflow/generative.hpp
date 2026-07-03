@@ -11,23 +11,27 @@
  * - GenerativeModel: 编排层，与ECN/DMN/SN协同
  */
 
-#include "tensor.hpp"
-#include "networks.hpp"
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <numeric>
+#include <queue>
+#include <random>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 #include "memory.hpp"
 #include "model.hpp"
-#include <vector>
-#include <memory>
-#include <string>
-#include <unordered_map>
-#include <algorithm>
-#include <random>
-#include <thread>
-#include <sstream>
-#include <fstream>
-#include <cmath>
-#include <numeric>
-#include <iostream>
-#include <queue>
+#include "networks.hpp"
+#include "tensor.hpp"
+
+#ifdef USE_CUDA
+#include "cuda_kernels.hpp"
+#endif
 
 namespace neuroflow {
 
@@ -43,7 +47,7 @@ enum class SamplingStrategyType : uint8_t {
 enum class FinishReason : uint8_t {
     EOS_TOKEN = 0,
     MAX_LENGTH = 1,
-    ERROR = 2
+    GEN_ERROR = 2
 };
 
 struct CausalLMConfig {
@@ -59,6 +63,9 @@ struct CausalLMConfig {
     size_t mla_max_cache_len = 4096;
     bool use_quantization = false;
     bool weight_tying = true;
+    size_t num_attn_layers = 2;
+    size_t num_attn_heads = 4;
+    std::string pooling = "mean";
 };
 
 struct GenerateConfig {
@@ -308,40 +315,51 @@ private:
         }
         if (obj_start == std::string::npos || brace_depth != 0) return;
 
-        std::string vocab_section = content.substr(obj_start + 1, obj_end - obj_start - 1);
-
         size_t id = 0;
-        size_t pos = 0;
-        while (pos < vocab_section.size()) {
-            size_t key_start = vocab_section.find('\"', pos);
-            if (key_start == std::string::npos) break;
-            size_t key_end = vocab_section.find('\"', key_start + 1);
-            if (key_end == std::string::npos) break;
+        size_t pos = obj_start + 1;
+        size_t obj_limit = obj_end;
+        size_t parse_errors = 0;
+        while (pos < obj_limit) {
+            size_t key_start = content.find('"', pos);
+            if (key_start == std::string::npos || key_start >= obj_limit) break;
+            size_t key_end = content.find('"', key_start + 1);
+            if (key_end == std::string::npos || key_end >= obj_limit) break;
 
-            std::string key = vocab_section.substr(key_start + 1, key_end - key_start - 1);
+            std::string key = content.substr(key_start + 1, key_end - key_start - 1);
 
-            size_t colon = vocab_section.find(':', key_end);
-            if (colon == std::string::npos) break;
+            size_t colon = content.find(':', key_end);
+            if (colon == std::string::npos || colon >= obj_limit) break;
 
             size_t val_start = colon + 1;
-            while (val_start < vocab_section.size() &&
-                   (vocab_section[val_start] == ' ' || vocab_section[val_start] == '\t'))
+            while (val_start < obj_limit &&
+                   (content[val_start] == ' ' || content[val_start] == '\t' ||
+                    content[val_start] == '\n' || content[val_start] == '\r'))
                 ++val_start;
 
             size_t val_end = val_start;
-            while (val_end < vocab_section.size() &&
-                   vocab_section[val_end] != ',' && vocab_section[val_end] != '}')
+            while (val_end < obj_limit &&
+                   content[val_end] != ',' && content[val_end] != '}' &&
+                   content[val_end] != '\n' && content[val_end] != '\r')
                 ++val_end;
 
-            std::string val_str = vocab_section.substr(val_start, val_end - val_start);
-            size_t token_id = std::stoul(val_str);
-
-            vocab_[key] = token_id;
-            id_to_token_[token_id] = key;
-            id = token_id + 1;
+            std::string val_str = content.substr(val_start, val_end - val_start);
+            try {
+                size_t token_id = std::stoul(val_str);
+                vocab_[key] = token_id;
+                id_to_token_[token_id] = key;
+                id = token_id + 1;
+            } catch (...) {
+                parse_errors++;
+                if (parse_errors <= 3) {
+                    std::cerr << "[Tokenizer] Parse error at key=" << key << " val=" << val_str << std::endl;
+                }
+            }
             pos = val_end + 1;
         }
         vocab_size_ = id;
+        if (parse_errors > 0) {
+            std::cerr << "[Tokenizer] Total parse errors: " << parse_errors << std::endl;
+        }
 
         size_t merges_pos = content.find("\"merges\":");
         if (merges_pos == std::string::npos) merges_pos = content.find("\"merges\" :");
@@ -395,7 +413,7 @@ public:
             else if ((text[i] & 0xF8) == 0xF0) char_len = 4;
 
             bool matched = false;
-            for (size_t len = char_len; len <= std::min(text.size() - i, (size_t)20); ++len) {
+            for (size_t len = char_len; len <= std::min(text.size() - i, static_cast<size_t>(20)); ++len) {
                 std::string sub = (len == char_len) ?
                     text.substr(i, len) : ("##" + text.substr(i, len));
                 auto it = vocab_.find(sub);
@@ -637,6 +655,505 @@ public:
     }
 };
 
+class CausalSelfAttention {
+public:
+    size_t n_heads_;
+    size_t d_model_;
+    size_t head_dim_;
+
+    std::shared_ptr<Linear> w_qkv;
+    std::shared_ptr<Linear> w_out;
+    std::shared_ptr<LayerNorm> norm;
+
+    struct Cache {
+        Tensor input;
+        Tensor qkv;
+        Tensor attn_weights;
+        Tensor attn_output;
+        Tensor w_out_input;
+        Tensor residual;
+    };
+    Cache cache_;
+
+    CausalSelfAttention(size_t d_model, size_t n_heads)
+        : n_heads_(n_heads), d_model_(d_model), head_dim_(d_model / n_heads) {
+        w_qkv = std::make_shared<Linear>(d_model, d_model * 3, true);
+        w_out = std::make_shared<Linear>(d_model, d_model, true);
+        norm = std::make_shared<LayerNorm>(d_model);
+    }
+
+    Tensor forward(const Tensor& x) {
+        cache_.input = x.clone();
+        size_t seq_len = x.shape_[0];
+
+        cache_.qkv = w_qkv->forward(x);
+
+        cache_.attn_weights = Tensor({n_heads_, seq_len, seq_len}, QuantType::FP32);
+        cache_.attn_output = Tensor({seq_len, d_model_}, QuantType::FP32);
+
+        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && x.is_on_gpu()) {
+            cache_.attn_weights.to_gpu();
+            cache_.attn_output.to_gpu();
+            const float* qkvp = cache_.qkv.as_gpu_fp32();
+            float* aw = cache_.attn_weights.as_gpu_fp32();
+            float* ao = cache_.attn_output.as_gpu_fp32();
+            auto stream = CudaContext::instance().stream();
+
+            launch_fill_zero(ao, seq_len * d_model_, stream);
+
+            for (size_t h = 0; h < n_heads_; ++h) {
+                size_t q_off = h * head_dim_;
+                size_t k_off = d_model_ + h * head_dim_;
+                size_t v_off = 2 * d_model_ + h * head_dim_;
+
+                Tensor Q_h({seq_len, head_dim_}, QuantType::FP32);
+                Tensor K_h({seq_len, head_dim_}, QuantType::FP32);
+                Tensor V_h({seq_len, head_dim_}, QuantType::FP32);
+                Q_h.to_gpu(); K_h.to_gpu(); V_h.to_gpu();
+
+                launch_extract_qkv(Q_h.as_gpu_fp32(), K_h.as_gpu_fp32(), V_h.as_gpu_fp32(),
+                                    qkvp, seq_len, d_model_, head_dim_, h, stream);
+
+                float* aw_h = aw + h * seq_len * seq_len;
+                CudaContext::instance().sgemm_rowmajor(false, true,
+                    static_cast<int>(seq_len), static_cast<int>(seq_len), static_cast<int>(head_dim_),
+                    scale, Q_h.as_gpu_fp32(), static_cast<int>(head_dim_),
+                    K_h.as_gpu_fp32(), static_cast<int>(head_dim_),
+                    0.0f, aw_h, static_cast<int>(seq_len));
+
+                launch_causal_softmax(aw_h, seq_len, stream);
+
+                float* ao_ptr = ao;
+                CudaContext::instance().sgemm_rowmajor(false, false,
+                    static_cast<int>(seq_len), static_cast<int>(head_dim_), static_cast<int>(seq_len),
+                    1.0f, aw_h, static_cast<int>(seq_len),
+                    V_h.as_gpu_fp32(), static_cast<int>(head_dim_),
+                    1.0f, ao_ptr, static_cast<int>(d_model_));
+
+                cache_.attn_weights.gpu_dirty_ = true;
+                cache_.attn_output.gpu_dirty_ = true;
+            }
+
+            cache_.w_out_input = cache_.attn_output.clone();
+            Tensor projected = w_out->forward(cache_.attn_output);
+
+            cache_.residual = Tensor({seq_len, d_model_}, QuantType::FP32);
+            cache_.residual.to_gpu();
+            launch_add(cache_.residual.as_gpu_fp32(), projected.as_gpu_fp32(), cache_.input.as_gpu_fp32(), seq_len * d_model_, stream);
+            cache_.residual.gpu_dirty_ = true;
+
+            return norm->forward(cache_.residual);
+        }
+#endif
+
+        const float* qkvp = cache_.qkv.as_fp32();
+        float* aw = cache_.attn_weights.as_fp32();
+        float* ao = cache_.attn_output.as_fp32();
+        memset(ao, 0, cache_.attn_output.data_size_);
+        const float* xp = x.as_fp32();
+
+        for (size_t h = 0; h < n_heads_; ++h) {
+            size_t q_off = h * head_dim_;
+            size_t k_off = d_model_ + h * head_dim_;
+            size_t v_off = 2 * d_model_ + h * head_dim_;
+
+            for (size_t i = 0; i < seq_len; ++i) {
+                for (size_t j = 0; j <= i; ++j) {
+                    float dot = 0.0f;
+                    for (size_t d = 0; d < head_dim_; ++d) {
+                        dot += qkvp[i * 3 * d_model_ + q_off + d]
+                             * qkvp[j * 3 * d_model_ + k_off + d];
+                    }
+                    aw[h * seq_len * seq_len + i * seq_len + j] = dot * scale;
+                }
+            }
+
+            for (size_t i = 0; i < seq_len; ++i) {
+                float max_val = -1e30f;
+                for (size_t j = 0; j <= i; ++j) {
+                    if (aw[h * seq_len * seq_len + i * seq_len + j] > max_val)
+                        max_val = aw[h * seq_len * seq_len + i * seq_len + j];
+                }
+                float sum = 0.0f;
+                for (size_t j = 0; j <= i; ++j) {
+                    aw[h * seq_len * seq_len + i * seq_len + j] = std::exp(aw[h * seq_len * seq_len + i * seq_len + j] - max_val);
+                    sum += aw[h * seq_len * seq_len + i * seq_len + j];
+                }
+                for (size_t j = 0; j <= i; ++j) {
+                    aw[h * seq_len * seq_len + i * seq_len + j] /= sum;
+                }
+                for (size_t j = i + 1; j < seq_len; ++j) {
+                    aw[h * seq_len * seq_len + i * seq_len + j] = 0.0f;
+                }
+            }
+
+            for (size_t i = 0; i < seq_len; ++i) {
+                for (size_t d = 0; d < head_dim_; ++d) {
+                    float val = 0.0f;
+                    for (size_t j = 0; j <= i; ++j) {
+                        val += aw[h * seq_len * seq_len + i * seq_len + j] * qkvp[j * 3 * d_model_ + v_off + d];
+                    }
+                    ao[i * d_model_ + h * head_dim_ + d] = val;
+                }
+            }
+        }
+
+        cache_.w_out_input = cache_.attn_output.clone();
+        Tensor projected = w_out->forward(cache_.attn_output);
+
+        cache_.residual = Tensor({seq_len, d_model_}, QuantType::FP32);
+        float* rp = cache_.residual.as_fp32();
+        const float* pp = projected.as_fp32();
+        const float* xpp = xp;
+        for (size_t i = 0; i < seq_len * d_model_; ++i) {
+            rp[i] = pp[i] + xpp[i];
+        }
+
+        return norm->forward(cache_.residual);
+    }
+
+    struct Gradients {
+        Tensor w_qkv_weight_grad;
+        Tensor w_qkv_bias_grad;
+        Tensor w_out_weight_grad;
+        Tensor w_out_bias_grad;
+        Tensor input_grad;
+    };
+
+    Gradients backward(const Tensor& output_grad) {
+        Gradients grads;
+        size_t seq_len = cache_.input.shape_[0];
+        const float* og = output_grad.as_fp32();
+        const float* aw = cache_.attn_weights.as_fp32();
+        const float* qkvp = cache_.qkv.as_fp32();
+
+        Tensor residual_grad = layernorm_backward_impl(cache_.residual, norm->weight, output_grad);
+
+        const float* rg = residual_grad.as_fp32();
+
+        Tensor proj_grad({seq_len, d_model_}, QuantType::FP32);
+        float* pg = proj_grad.as_fp32();
+        memcpy(pg, rg, proj_grad.data_size_);
+
+        grads.w_out_weight_grad = linear_backward_weight_impl(cache_.w_out_input, proj_grad);
+        grads.w_out_bias_grad = bias_backward_impl(proj_grad);
+
+        Tensor attn_out_grad = linear_backward_input_impl(proj_grad, w_out->weight);
+
+        const float* aog = attn_out_grad.as_fp32();
+
+        Tensor d_qkv({seq_len, 3 * d_model_}, QuantType::FP32);
+        float* dqkvp = d_qkv.as_fp32();
+        memset(dqkvp, 0, d_qkv.data_size_);
+
+        float inv_scale = 1.0f / std::sqrt(static_cast<float>(head_dim_));
+
+        for (size_t h = 0; h < n_heads_; ++h) {
+            size_t q_off = h * head_dim_;
+            size_t k_off = d_model_ + h * head_dim_;
+            size_t v_off = 2 * d_model_ + h * head_dim_;
+
+            // Extract per-head Q, K, V from cached qkv: [seq_len, head_dim]
+            Tensor Q_h({seq_len, head_dim_}, QuantType::FP32);
+            Tensor K_h({seq_len, head_dim_}, QuantType::FP32);
+            Tensor V_h({seq_len, head_dim_}, QuantType::FP32);
+            float* qh = Q_h.as_fp32();
+            float* kh = K_h.as_fp32();
+            float* vh = V_h.as_fp32();
+            for (size_t i = 0; i < seq_len; ++i) {
+                memcpy(qh + i * head_dim_, qkvp + i * 3 * d_model_ + q_off, head_dim_ * sizeof(float));
+                memcpy(kh + i * head_dim_, qkvp + i * 3 * d_model_ + k_off, head_dim_ * sizeof(float));
+                memcpy(vh + i * head_dim_, qkvp + i * 3 * d_model_ + v_off, head_dim_ * sizeof(float));
+            }
+
+            // Extract per-head attn_out_grad: [seq_len, head_dim]
+            Tensor aog_h({seq_len, head_dim_}, QuantType::FP32);
+            float* aogh = aog_h.as_fp32();
+            for (size_t i = 0; i < seq_len; ++i) {
+                memcpy(aogh + i * head_dim_, aog + i * d_model_ + h * head_dim_, head_dim_ * sizeof(float));
+            }
+
+            // d_attn_weights = aog_h @ V_h^T: [seq_len, seq_len]
+            // But with causal mask: only j <= i
+            Tensor d_attn_weights({seq_len, seq_len}, QuantType::FP32);
+            float* daw = d_attn_weights.as_fp32();
+            memset(daw, 0, d_attn_weights.data_size_);
+
+#ifdef USE_CUDA
+            if (CudaContext::instance().is_available() && cache_.qkv.is_on_gpu()) {
+                d_attn_weights.to_gpu();
+                CudaContext::instance().sgemm_rowmajor(false, true,
+                    static_cast<int>(seq_len), static_cast<int>(seq_len), static_cast<int>(head_dim_),
+                    1.0f, aog_h.as_gpu_fp32(), static_cast<int>(head_dim_),
+                    V_h.as_gpu_fp32(), static_cast<int>(head_dim_),
+                    0.0f, d_attn_weights.as_gpu_fp32(), static_cast<int>(seq_len));
+                launch_causal_mask_zero(d_attn_weights.as_gpu_fp32(), seq_len, CudaContext::instance().stream());
+                d_attn_weights.gpu_dirty_ = true;
+            } else
+#endif
+#ifdef USE_CBLAS
+            // Full matmul then zero out future positions
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        seq_len, seq_len, head_dim_,
+                        1.0f, aogh, head_dim_, vh, head_dim_,
+                        0.0f, daw, seq_len);
+            // Apply causal mask: zero j > i
+            for (size_t i = 0; i < seq_len; ++i) {
+                for (size_t j = i + 1; j < seq_len; ++j) {
+                    daw[i * seq_len + j] = 0.0f;
+                }
+            }
+#else
+            for (size_t i = 0; i < seq_len; ++i) {
+                for (size_t j = 0; j <= i; ++j) {
+                    float sum = 0.0f;
+                    for (size_t d = 0; d < head_dim_; ++d) {
+                        sum += aogh[i * head_dim_ + d] * vh[j * head_dim_ + d];
+                    }
+                    daw[i * seq_len + j] = sum;
+                }
+            }
+#endif
+
+            // d_V = attn_weights[h]^T @ aog_h: [seq_len, head_dim]
+            // With causal: d_V[j,d] += aw[h,i,j] * aogh[i,d] for i >= j
+            Tensor d_V_h({seq_len, head_dim_}, QuantType::FP32);
+            float* dvh = d_V_h.as_fp32();
+            memset(dvh, 0, d_V_h.data_size_);
+            {
+                const float* aw_h = aw + h * seq_len * seq_len;
+                for (size_t i = 0; i < seq_len; ++i) {
+                    for (size_t j = 0; j <= i; ++j) {
+                        float s = aw_h[i * seq_len + j];
+                        for (size_t d = 0; d < head_dim_; ++d) {
+                            dvh[j * head_dim_ + d] += s * aogh[i * head_dim_ + d];
+                        }
+                    }
+                }
+            }
+
+            // Softmax backward: d_score[i,j] = s[i,j] * (daw[i,j] - sum_k(s[i,k] * daw[i,k]))
+            // Then d_score *= inv_scale
+            Tensor d_scores({seq_len, seq_len}, QuantType::FP32);
+            float* dsp = d_scores.as_fp32();
+            memset(dsp, 0, d_scores.data_size_);
+            {
+                const float* aw_h = aw + h * seq_len * seq_len;
+                for (size_t i = 0; i < seq_len; ++i) {
+                    float dot = 0.0f;
+                    for (size_t k = 0; k <= i; ++k) {
+                        dot += aw_h[i * seq_len + k] * daw[i * seq_len + k];
+                    }
+                    for (size_t j = 0; j <= i; ++j) {
+                        float s = aw_h[i * seq_len + j];
+                        dsp[i * seq_len + j] = s * (daw[i * seq_len + j] - dot) * inv_scale;
+                    }
+                }
+            }
+
+            // d_Q = d_scores @ K_h: [seq_len, head_dim]
+            // d_K = d_scores^T @ Q_h: [seq_len, head_dim]
+            Tensor d_Q_h({seq_len, head_dim_}, QuantType::FP32);
+            Tensor d_K_h({seq_len, head_dim_}, QuantType::FP32);
+#ifdef USE_CUDA
+            if (CudaContext::instance().is_available() && cache_.qkv.is_on_gpu()) {
+                d_Q_h.to_gpu(); d_K_h.to_gpu();
+                CudaContext::instance().sgemm_rowmajor(false, false,
+                    static_cast<int>(seq_len), static_cast<int>(head_dim_), static_cast<int>(seq_len),
+                    1.0f, d_scores.as_gpu_fp32(), static_cast<int>(seq_len),
+                    K_h.as_gpu_fp32(), static_cast<int>(head_dim_),
+                    0.0f, d_Q_h.as_gpu_fp32(), static_cast<int>(head_dim_));
+                CudaContext::instance().sgemm_rowmajor(true, false,
+                    static_cast<int>(seq_len), static_cast<int>(head_dim_), static_cast<int>(seq_len),
+                    1.0f, d_scores.as_gpu_fp32(), static_cast<int>(seq_len),
+                    Q_h.as_gpu_fp32(), static_cast<int>(head_dim_),
+                    0.0f, d_K_h.as_gpu_fp32(), static_cast<int>(head_dim_));
+                d_Q_h.gpu_dirty_ = true;
+                d_K_h.gpu_dirty_ = true;
+            } else
+#endif
+#ifdef USE_CBLAS
+            // d_Q = d_scores @ K
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        seq_len, head_dim_, seq_len,
+                        1.0f, dsp, seq_len, kh, head_dim_,
+                        0.0f, d_Q_h.as_fp32(), head_dim_);
+            // d_K = d_scores^T @ Q
+            cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                        seq_len, head_dim_, seq_len,
+                        1.0f, dsp, seq_len, qh, head_dim_,
+                        0.0f, d_K_h.as_fp32(), head_dim_);
+#else
+            {
+                float* dqh = d_Q_h.as_fp32();
+                float* dkh = d_K_h.as_fp32();
+                memset(dqh, 0, d_Q_h.data_size_);
+                memset(dkh, 0, d_K_h.data_size_);
+                for (size_t i = 0; i < seq_len; ++i) {
+                    for (size_t j = 0; j <= i; ++j) {
+                        float ds = dsp[i * seq_len + j];
+                        for (size_t d = 0; d < head_dim_; ++d) {
+                            dqh[i * head_dim_ + d] += ds * kh[j * head_dim_ + d];
+                            dkh[j * head_dim_ + d] += ds * qh[i * head_dim_ + d];
+                        }
+                    }
+                }
+            }
+#endif
+
+            // Scatter d_Q, d_K, d_V back into d_qkv
+            {
+                const float* dqh = d_Q_h.as_fp32();
+                const float* dkh = d_K_h.as_fp32();
+                for (size_t i = 0; i < seq_len; ++i) {
+                    for (size_t d = 0; d < head_dim_; ++d) {
+                        dqkvp[i * 3 * d_model_ + q_off + d] += dqh[i * head_dim_ + d];
+                        dqkvp[i * 3 * d_model_ + k_off + d] += dkh[i * head_dim_ + d];
+                        dqkvp[i * 3 * d_model_ + v_off + d] += dvh[i * head_dim_ + d];
+                    }
+                }
+            }
+        }
+
+        grads.w_qkv_weight_grad = linear_backward_weight_impl(cache_.input, d_qkv);
+        grads.w_qkv_bias_grad = bias_backward_impl(d_qkv);
+
+        Tensor qkv_input_grad = linear_backward_input_impl(d_qkv, w_qkv->weight);
+
+        grads.input_grad = Tensor({seq_len, d_model_}, QuantType::FP32);
+        float* ig = grads.input_grad.as_fp32();
+        const float* qig = qkv_input_grad.as_fp32();
+        for (size_t i = 0; i < seq_len * d_model_; ++i) {
+            ig[i] = pg[i] + qig[i];
+        }
+
+        return grads;
+    }
+
+private:
+    Tensor layernorm_backward_impl(const Tensor& input, const Tensor& weight, const Tensor& output_grad, float eps = 1e-5f) {
+        size_t seq_len = input.shape_[0];
+        size_t dim = input.shape_[1];
+        Tensor input_grad({seq_len, dim}, QuantType::FP32);
+        const float* inp = input.as_fp32();
+        const float* w = weight.as_fp32();
+        const float* og = output_grad.as_fp32();
+        float* ig = input_grad.as_fp32();
+        for (size_t i = 0; i < seq_len; ++i) {
+            float mean = 0.0f;
+            for (size_t d = 0; d < dim; ++d) mean += inp[i * dim + d];
+            mean /= dim;
+            float var = 0.0f;
+            for (size_t d = 0; d < dim; ++d) { float diff = inp[i * dim + d] - mean; var += diff * diff; }
+            var /= dim;
+            float inv_std = 1.0f / std::sqrt(var + eps);
+            float sum_gn = 0.0f, sum_gnx = 0.0f;
+            for (size_t d = 0; d < dim; ++d) {
+                float norm = (inp[i * dim + d] - mean) * inv_std;
+                float gn = og[i * dim + d] * w[d];
+                sum_gn += gn; sum_gnx += gn * norm;
+            }
+            for (size_t d = 0; d < dim; ++d) {
+                float norm = (inp[i * dim + d] - mean) * inv_std;
+                float gn = og[i * dim + d] * w[d];
+                ig[i * dim + d] = inv_std * (gn - sum_gn / dim - norm * sum_gnx / dim);
+            }
+        }
+        return input_grad;
+    }
+
+    Tensor linear_backward_weight_impl(const Tensor& input, const Tensor& output_grad) {
+        size_t batch = input.shape_[0];
+        size_t in_f = input.shape_[1];
+        size_t out_f = output_grad.shape_[1];
+        Tensor weight_grad({out_f, in_f}, QuantType::FP32);
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && input.is_on_gpu()) {
+            weight_grad.to_gpu();
+            CudaContext::instance().sgemm_rowmajor(true, false,
+                static_cast<int>(out_f), static_cast<int>(in_f), static_cast<int>(batch),
+                1.0f / batch, output_grad.as_gpu_fp32(), static_cast<int>(out_f),
+                input.as_gpu_fp32(), static_cast<int>(in_f),
+                0.0f, weight_grad.as_gpu_fp32(), static_cast<int>(in_f));
+            weight_grad.gpu_dirty_ = true;
+            return weight_grad;
+        }
+#endif
+#ifdef USE_CBLAS
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                    out_f, in_f, batch,
+                    1.0f / batch, output_grad.as_fp32(), out_f, input.as_fp32(), in_f,
+                    0.0f, weight_grad.as_fp32(), in_f);
+#else
+        const float* inp = input.as_fp32();
+        const float* og = output_grad.as_fp32();
+        float* wg = weight_grad.as_fp32();
+        for (size_t i = 0; i < out_f; ++i) {
+            for (size_t j = 0; j < in_f; ++j) {
+                float sum = 0.0f;
+                for (size_t b = 0; b < batch; ++b) sum += og[b * out_f + i] * inp[b * in_f + j];
+                wg[i * in_f + j] = sum / batch;
+            }
+        }
+#endif
+        return weight_grad;
+    }
+
+    Tensor linear_backward_input_impl(const Tensor& output_grad, const Tensor& weight) {
+        size_t batch = output_grad.shape_[0];
+        size_t out_f = output_grad.shape_[1];
+        size_t in_f = weight.shape_[1];
+        Tensor input_grad({batch, in_f}, QuantType::FP32);
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && output_grad.is_on_gpu()) {
+            input_grad.to_gpu();
+            CudaContext::instance().sgemm_rowmajor(false, false,
+                static_cast<int>(batch), static_cast<int>(in_f), static_cast<int>(out_f),
+                1.0f, output_grad.as_gpu_fp32(), static_cast<int>(out_f),
+                weight.as_gpu_fp32(), static_cast<int>(in_f),
+                0.0f, input_grad.as_gpu_fp32(), static_cast<int>(in_f));
+            input_grad.gpu_dirty_ = true;
+            return input_grad;
+        }
+#endif
+#ifdef USE_CBLAS
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    batch, in_f, out_f,
+                    1.0f, output_grad.as_fp32(), out_f, weight.as_fp32(), in_f,
+                    0.0f, input_grad.as_fp32(), in_f);
+#else
+        const float* og = output_grad.as_fp32();
+        const float* w = weight.as_fp32();
+        float* ig = input_grad.as_fp32();
+        for (size_t b = 0; b < batch; ++b) {
+            for (size_t j = 0; j < in_f; ++j) {
+                float sum = 0.0f;
+                for (size_t i = 0; i < out_f; ++i) sum += og[b * out_f + i] * w[i * in_f + j];
+                ig[b * in_f + j] = sum;
+            }
+        }
+#endif
+        return input_grad;
+    }
+
+    Tensor bias_backward_impl(const Tensor& output_grad) {
+        size_t batch = output_grad.shape_[0];
+        size_t dim = output_grad.shape_[1];
+        Tensor grad({dim}, QuantType::FP32);
+        const float* og = output_grad.as_fp32();
+        float* g = grad.as_fp32();
+        for (size_t j = 0; j < dim; ++j) {
+            float sum = 0.0f;
+            for (size_t b = 0; b < batch; ++b) sum += og[b * dim + j];
+            g[j] = sum / batch;
+        }
+        return grad;
+    }
+};
+
 class CausalLMHead {
 public:
     CausalLMConfig config_;
@@ -656,6 +1173,27 @@ public:
     std::shared_ptr<LayerNorm> ln_;
     std::shared_ptr<LatentKVCache> kv_cache_;
     Tensor last_hidden_;
+    Tensor last_projected_;
+    std::vector<std::unique_ptr<CausalSelfAttention>> attn_layers_;
+
+    struct TrainingCache {
+        std::vector<size_t> input_ids;
+        Tensor x_embed;
+        Tensor x_pos;
+        std::vector<Tensor> attn_inputs;
+        std::vector<Tensor> attn_qkv;
+        std::vector<Tensor> attn_outputs;
+        std::vector<Tensor> attn_weights;
+        Tensor x_gate_in;
+        Tensor x_after_gate;
+        Tensor x_sae_encoded;
+        Tensor x_after_sae;
+        Tensor x_after_ntm;
+        Tensor x_after_ln;
+        Tensor x_pooled;
+        Tensor x_projected;
+    };
+    TrainingCache train_cache_;
 
     size_t sliding_window_drops_;
 
@@ -729,15 +1267,38 @@ public:
         }
 
         last_hidden_ = Tensor({1, config_.d_model}, QuantType::FP32);
+
+        for (size_t i = 0; i < config_.num_attn_layers; ++i) {
+            attn_layers_.push_back(std::make_unique<CausalSelfAttention>(
+                config_.d_model, config_.num_attn_heads));
+        }
     }
 
     Tensor embed_lookup(const std::vector<size_t>& ids) {
         size_t seq_len = ids.size();
         Tensor output({seq_len, config_.d_model}, QuantType::FP32);
+        float scale = std::sqrt(static_cast<float>(config_.d_model));
+
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && w_embed_.is_on_gpu()) {
+            output.to_gpu();
+            std::vector<int> int_ids(ids.size());
+            for (size_t i = 0; i < ids.size(); ++i) {
+                int_ids[i] = static_cast<int>(ids[i] >= config_.vocab_size ? 1 : ids[i]);
+            }
+            void* d_ids = CudaContext::instance().alloc(int_ids.size() * sizeof(int));
+            CudaContext::instance().copy_h2d(d_ids, int_ids.data(), int_ids.size() * sizeof(int));
+            launch_embed_lookup(output.as_gpu_fp32(), w_embed_.as_gpu_fp32(),
+                                static_cast<const int*>(d_ids), seq_len, config_.d_model, scale,
+                                CudaContext::instance().stream());
+            CudaContext::instance().free(d_ids);
+            output.gpu_dirty_ = true;
+            return output;
+        }
+#endif
+
         float* out = output.as_fp32();
         float* embed = w_embed_.as_fp32();
-
-        float scale = std::sqrt(static_cast<float>(config_.d_model));
 
         for (size_t i = 0; i < seq_len; ++i) {
             size_t tid = ids[i];
@@ -756,6 +1317,18 @@ public:
 
     Tensor positional_encode(const Tensor& x, size_t offset = 0) {
         Tensor result = x.clone();
+
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && x.is_on_gpu()) {
+            result.to_gpu();
+            launch_positional_encode(result.as_gpu_fp32(), w_pos_.as_gpu_fp32(),
+                x.shape_[0], config_.d_model, static_cast<int>(offset),
+                CudaContext::instance().stream());
+            result.gpu_dirty_ = true;
+            return result;
+        }
+#endif
+
         float* out = result.as_fp32();
         const float* pos = w_pos_.as_fp32();
 
@@ -905,17 +1478,46 @@ public:
         return output;
     }
 
+    Tensor mean_pool(const Tensor& x) {
+        size_t seq_len = x.shape_[0];
+        const float* xp = x.as_fp32();
+
+        Tensor output({1, config_.d_model}, QuantType::FP32);
+        float* out = output.as_fp32();
+        float inv_n = 1.0f / static_cast<float>(seq_len);
+        for (size_t d = 0; d < config_.d_model; ++d) {
+            float sum = 0.0f;
+            for (size_t i = 0; i < seq_len; ++i) {
+                sum += xp[i * config_.d_model + d];
+            }
+            out[d] = sum * inv_n;
+        }
+
+        last_hidden_ = output.clone();
+        return output;
+    }
+
+    Tensor pool(const Tensor& x) {
+        if (config_.pooling == "mean") {
+            return mean_pool(x);
+        }
+        return last_token_pool(x);
+    }
+
     Tensor forward(const std::vector<size_t>& token_ids) {
         Tensor x = embed_lookup(token_ids);
         x = positional_encode(x, 0);
+        for (auto& attn : attn_layers_) {
+            x = attn->forward(x);
+        }
         x = causal_window_gate(x);
         x = sae_sparse(x);
         x = ntm_memory_access(x);
         x = ln_->forward(x);
 
-        Tensor pooled = last_token_pool(x);
-        Tensor projected = w_proj_->forward(pooled);
-        Tensor logits = w_out_->forward(projected);
+        Tensor pooled = pool(x);
+        last_projected_ = w_proj_->forward(pooled);
+        Tensor logits = w_out_->forward(last_projected_);
         return logits;
     }
 
@@ -923,17 +1525,505 @@ public:
         std::vector<size_t> ids = {token_id};
         Tensor x = embed_lookup(ids);
         x = positional_encode(x, pos);
+        for (auto& attn : attn_layers_) {
+            x = attn->forward(x);
+        }
         x = causal_window_gate(x);
         x = sae_sparse(x);
         x = ntm_memory_access(x);
         x = ln_->forward(x);
 
         last_hidden_ = x.clone();
-        Tensor projected = w_proj_->forward(x);
-        Tensor logits = w_out_->forward(projected);
+        last_projected_ = w_proj_->forward(x);
+        Tensor logits = w_out_->forward(last_projected_);
         return logits;
     }
 
+    Tensor forward_for_training(const std::vector<size_t>& token_ids) {
+        train_cache_.input_ids = token_ids;
+        train_cache_.x_embed = embed_lookup(token_ids);
+        train_cache_.x_pos = positional_encode(train_cache_.x_embed, 0);
+
+        Tensor x = train_cache_.x_pos;
+        train_cache_.attn_inputs.clear();
+        train_cache_.attn_qkv.clear();
+        train_cache_.attn_outputs.clear();
+        train_cache_.attn_weights.clear();
+
+        for (auto& attn : attn_layers_) {
+            train_cache_.attn_inputs.push_back(x.clone());
+            x = attn->forward(x);
+            train_cache_.attn_outputs.push_back(x.clone());
+        }
+
+        train_cache_.x_gate_in = x.clone();
+        x = causal_window_gate(x);
+        train_cache_.x_after_gate = x.clone();
+
+        train_cache_.x_sae_encoded = sae_w_encode_->forward(x);
+        size_t n = train_cache_.x_sae_encoded.numel();
+        size_t k = config_.sae_k;
+
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && train_cache_.x_sae_encoded.is_on_gpu()) {
+            train_cache_.x_sae_encoded.to_gpu();
+            launch_sae_topk_mask(train_cache_.x_sae_encoded.as_gpu_fp32(), n, k,
+                                 CudaContext::instance().stream());
+            train_cache_.x_sae_encoded.gpu_dirty_ = true;
+        } else
+#endif
+        {
+            float* enc_data = train_cache_.x_sae_encoded.as_fp32();
+            if (k < n) {
+                std::vector<size_t> indices(n);
+                std::iota(indices.begin(), indices.end(), 0);
+                std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
+                                  [&](size_t a, size_t b) { return std::abs(enc_data[a]) > std::abs(enc_data[b]); });
+                std::vector<bool> keep(n, false);
+                for (size_t i = 0; i < k; ++i) keep[indices[i]] = true;
+                for (size_t i = 0; i < n; ++i) { if (!keep[i]) enc_data[i] = 0.0f; }
+            }
+        }
+
+        x = sae_w_decode_->forward(train_cache_.x_sae_encoded);
+        train_cache_.x_after_sae = x.clone();
+
+        x = ntm_memory_access(x);
+        train_cache_.x_after_ntm = x.clone();
+
+        x = ln_->forward(x);
+        train_cache_.x_after_ln = x.clone();
+
+        train_cache_.x_pooled = pool(x);
+        train_cache_.x_projected = w_proj_->forward(train_cache_.x_pooled);
+        Tensor logits = w_out_->forward(train_cache_.x_projected);
+        return logits;
+    }
+
+    struct LMGradients {
+        std::vector<CausalSelfAttention::Gradients> attn_grads;
+        Tensor w_proj_weight_grad;
+        Tensor w_proj_bias_grad;
+        Tensor w_out_weight_grad;
+        Tensor w_out_bias_grad;
+        Tensor embed_grad;
+        std::vector<size_t> used_token_ids;
+        Tensor ln_weight_grad;
+        Tensor ln_bias_grad;
+        Tensor ntm_read_weight_grad;
+        Tensor ntm_write_weight_grad;
+        Tensor ntm_erase_weight_grad;
+        Tensor sae_encode_weight_grad;
+        Tensor sae_decode_weight_grad;
+        Tensor dw_kernel_grad;
+        Tensor pw_conv_weight_grad;
+        Tensor pw_conv_bias_grad;
+    };
+
+    LMGradients backward_from_logits(const Tensor& logits_grad) {
+        LMGradients grads;
+        size_t d_model = config_.d_model;
+        size_t seq_len = train_cache_.x_after_ln.shape_[0];
+
+        Tensor proj_grad = lm_head_linear_backward_input(logits_grad, w_out_->weight);
+
+        if (!config_.weight_tying) {
+            grads.w_out_weight_grad = lm_head_linear_backward_weight(train_cache_.x_projected, logits_grad);
+        }
+        grads.w_out_bias_grad = lm_head_bias_backward(logits_grad);
+
+        Tensor pooled_grad = lm_head_linear_backward_input(proj_grad, w_proj_->weight);
+        grads.w_proj_weight_grad = lm_head_linear_backward_weight(train_cache_.x_pooled, proj_grad);
+        grads.w_proj_bias_grad = lm_head_bias_backward(proj_grad);
+
+
+        Tensor x_grad;
+        if (config_.pooling == "mean") {
+            x_grad = Tensor({seq_len, d_model}, QuantType::FP32);
+            float* xg = x_grad.as_fp32();
+            const float* pg = pooled_grad.as_fp32();
+            float inv_n = 1.0f / static_cast<float>(seq_len);
+            for (size_t i = 0; i < seq_len; ++i) {
+                for (size_t d = 0; d < d_model; ++d) {
+                    xg[i * d_model + d] = pg[d] * inv_n;
+                }
+            }
+        } else {
+            x_grad = Tensor({seq_len, d_model}, QuantType::FP32);
+            memset(x_grad.as_fp32(), 0, x_grad.data_size_);
+            const float* pg = pooled_grad.as_fp32();
+            float* xg = x_grad.as_fp32();
+            memcpy(xg + (seq_len - 1) * d_model, pg, d_model * sizeof(float));
+        }
+
+        // LN backward
+        Tensor ln_input_grad = ln_backward_impl(train_cache_.x_after_ntm, ln_->weight, x_grad);
+
+        grads.ln_weight_grad = Tensor({d_model}, QuantType::FP32);
+        grads.ln_bias_grad = Tensor({d_model}, QuantType::FP32);
+        {
+            const float* og = x_grad.as_fp32();
+            const float* inp = train_cache_.x_after_ntm.as_fp32();
+            float* lwg = grads.ln_weight_grad.as_fp32();
+            float* lbg = grads.ln_bias_grad.as_fp32();
+            memset(lwg, 0, d_model * sizeof(float));
+            memset(lbg, 0, d_model * sizeof(float));
+            for (size_t i = 0; i < seq_len; ++i) {
+                float mean = 0.0f;
+                for (size_t d = 0; d < d_model; ++d) mean += inp[i * d_model + d];
+                mean /= d_model;
+                float var = 0.0f;
+                for (size_t d = 0; d < d_model; ++d) { float diff = inp[i * d_model + d] - mean; var += diff * diff; }
+                var /= d_model;
+                float inv_std = 1.0f / std::sqrt(var + 1e-5f);
+                for (size_t d = 0; d < d_model; ++d) {
+                    float norm = (inp[i * d_model + d] - mean) * inv_std;
+                    lwg[d] += og[i * d_model + d] * norm / seq_len;
+                    lbg[d] += og[i * d_model + d] / seq_len;
+                }
+            }
+        }
+        x_grad = ln_input_grad;
+
+        // NTM backward: h = x_after_sae + read_content, so dx_after_sae = x_grad (skip NTM internal grads)
+        grads.ntm_read_weight_grad = Tensor(ntm_w_read_->weight.shape_, QuantType::FP32);
+        grads.ntm_write_weight_grad = Tensor(ntm_w_write_->weight.shape_, QuantType::FP32);
+        grads.ntm_erase_weight_grad = Tensor(ntm_w_erase_->weight.shape_, QuantType::FP32);
+        // x_grad already flows through since h = x + read_content
+
+        // SAE backward
+        grads.sae_decode_weight_grad = lm_head_linear_backward_weight(train_cache_.x_sae_encoded, x_grad);
+        Tensor sae_dec_input_grad = lm_head_linear_backward_input(x_grad, sae_w_decode_->weight);
+        {
+            size_t n = sae_dec_input_grad.numel();
+            size_t k = config_.sae_k;
+#ifdef USE_CUDA
+            if (CudaContext::instance().is_available() && sae_dec_input_grad.is_on_gpu()) {
+                sae_dec_input_grad.to_gpu();
+                train_cache_.x_sae_encoded.to_gpu();
+                launch_sae_topk_mask_backward(sae_dec_input_grad.as_gpu_fp32(),
+                                              train_cache_.x_sae_encoded.as_gpu_fp32(),
+                                              n, k, CudaContext::instance().stream());
+                sae_dec_input_grad.gpu_dirty_ = true;
+            } else
+#endif
+            {
+                float* enc_g = sae_dec_input_grad.as_fp32();
+                const float* enc_data = train_cache_.x_sae_encoded.as_fp32();
+                if (k < n) {
+                    std::vector<size_t> indices(n);
+                    std::iota(indices.begin(), indices.end(), 0);
+                    std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
+                        [&](size_t a, size_t b) { return std::abs(enc_data[a]) > std::abs(enc_data[b]); });
+                    std::vector<bool> keep(n, false);
+                    for (size_t i = 0; i < k; ++i) keep[indices[i]] = true;
+                    for (size_t i = 0; i < n; ++i) { if (!keep[i]) enc_g[i] = 0.0f; }
+                }
+            }
+        }
+        grads.sae_encode_weight_grad = lm_head_linear_backward_weight(train_cache_.x_after_gate, sae_dec_input_grad);
+        x_grad = lm_head_linear_backward_input(sae_dec_input_grad, sae_w_encode_->weight);
+
+
+        // Causal gate backward (depthwise separable conv)
+        grads.dw_kernel_grad = Tensor(dw_kernel_.shape_, QuantType::FP32);
+        grads.pw_conv_weight_grad = Tensor(pw_conv_->weight.shape_, QuantType::FP32);
+        grads.pw_conv_bias_grad = Tensor(pw_conv_->bias.shape_, QuantType::FP32);
+        {
+            size_t C = d_model;
+            size_t K = config_.causal_window_size;
+            const float* xp = train_cache_.x_gate_in.as_fp32();
+            const float* gp = train_cache_.x_after_gate.as_fp32();
+            const float* xg = x_grad.as_fp32();
+            float* dkg = grads.dw_kernel_grad.as_fp32();
+            memset(dkg, 0, grads.dw_kernel_grad.data_size_);
+
+            Tensor gate_grad({seq_len, C}, QuantType::FP32);
+#ifdef USE_CUDA
+            if (CudaContext::instance().is_available() && x_grad.is_on_gpu()) {
+                gate_grad.to_gpu();
+                launch_sigmoid_backward(gate_grad.as_gpu_fp32(),
+                                        train_cache_.x_after_gate.as_gpu_fp32(),
+                                        train_cache_.x_gate_in.as_gpu_fp32(),
+                                        x_grad.as_gpu_fp32(),
+                                        seq_len * C, CudaContext::instance().stream());
+                gate_grad.gpu_dirty_ = true;
+            } else
+#endif
+            {
+                float* gg = gate_grad.as_fp32();
+                const float* xg = x_grad.as_fp32();
+                const float* gp = train_cache_.x_after_gate.as_fp32();
+                const float* xp = train_cache_.x_gate_in.as_fp32();
+                for (size_t i = 0; i < seq_len * C; ++i) {
+                    float g = 1.0f / (1.0f + std::exp(-gp[i]));
+                    gg[i] = xg[i] * g * (1.0f - g) * xp[i] + xg[i] * g;
+                }
+            }
+
+            Tensor pw_grad_tensor = lm_head_linear_backward_input(gate_grad, pw_conv_->weight);
+            const float* pw_grad = pw_grad_tensor.as_fp32();
+            grads.pw_conv_weight_grad = lm_head_linear_backward_weight(train_cache_.x_gate_in, gate_grad);
+            grads.pw_conv_bias_grad = lm_head_bias_backward(gate_grad);
+
+            for (size_t i = 0; i < seq_len; ++i) {
+                for (size_t c = 0; c < C; ++c) {
+                    for (size_t k = 0; k < K; ++k) {
+                        if (i >= k) {
+                            dkg[c * K + k] += pw_grad[i * C + c] * xp[(i - k) * C + c];
+                        }
+                    }
+                }
+            }
+
+            Tensor gate_input_grad({seq_len, C}, QuantType::FP32);
+            float* gig = gate_input_grad.as_fp32();
+            memset(gig, 0, gate_input_grad.data_size_);
+            const float* dkp = dw_kernel_.as_fp32();
+            for (size_t i = 0; i < seq_len; ++i) {
+                for (size_t c = 0; c < C; ++c) {
+                    float val = 0.0f;
+                    for (size_t k = 0; k < K; ++k) {
+                        if (i + k < seq_len) {
+                            val += pw_grad[(i + k) * C + c] * dkp[c * K + k];
+                        }
+                    }
+                    gig[i * C + c] = val + gg[i * C + c];
+                }
+            }
+            x_grad = gate_input_grad;
+        }
+
+
+        // Attention layers backward
+        for (int i = static_cast<int>(attn_layers_.size()) - 1; i >= 0; --i) {
+            auto attn_grads = attn_layers_[i]->backward(x_grad);
+            grads.attn_grads.insert(grads.attn_grads.begin(), std::move(attn_grads));
+            x_grad = attn_layers_[i]->cache_.input.shape_[0] == grads.attn_grads.front().input_grad.shape_[0]
+                ? grads.attn_grads.front().input_grad.clone()
+                : x_grad;
+        }
+
+        // Embed gradient: sparse update only for used token IDs
+        grads.embed_grad = Tensor({seq_len, d_model}, QuantType::FP32);
+        grads.used_token_ids = train_cache_.input_ids;
+
+        {
+            float* eg = grads.embed_grad.as_fp32();
+            const float* xg = x_grad.as_fp32();
+            float scale = std::sqrt(static_cast<float>(d_model));
+            for (size_t i = 0; i < seq_len; ++i) {
+                float norm_val = 0.0f;
+                for (size_t d = 0; d < d_model; ++d) norm_val += xg[i * d_model + d] * xg[i * d_model + d];
+                if (norm_val < 1e-20f) {
+                    memset(eg + i * d_model, 0, d_model * sizeof(float));
+                    continue;
+                }
+                for (size_t d = 0; d < d_model; ++d) {
+                    eg[i * d_model + d] = xg[i * d_model + d] * scale / seq_len;
+                }
+            }
+        }
+
+        return grads;
+    }
+
+    void apply_lm_gradients(LMGradients& grads, float lr) {
+        auto sgd_update = [&](Tensor& param, const Tensor& grad) {
+            if (param.shape_ != grad.shape_ || param.numel() == 0 || grad.numel() == 0) return;
+#ifdef USE_CUDA
+            if (CudaContext::instance().is_available() && param.is_on_gpu()) {
+                param.to_gpu();
+                grad.to_gpu();
+                launch_sgd_update(param.as_gpu_fp32(), grad.as_gpu_fp32(),
+                                  param.numel(), lr, CudaContext::instance().stream());
+                param.gpu_dirty_ = true;
+                return;
+            }
+#endif
+            float* p = param.as_fp32();
+            const float* g = grad.as_fp32();
+            size_t n = param.numel();
+            for (size_t i = 0; i < n; ++i) {
+                if (std::isfinite(g[i])) p[i] -= lr * g[i];
+            }
+        };
+
+        sgd_update(w_proj_->weight, grads.w_proj_weight_grad);
+        sgd_update(w_proj_->bias, grads.w_proj_bias_grad);
+        if (!config_.weight_tying) {
+            sgd_update(w_out_->weight, grads.w_out_weight_grad);
+        }
+        sgd_update(w_out_->bias, grads.w_out_bias_grad);
+
+        sgd_update(ln_->weight, grads.ln_weight_grad);
+        sgd_update(ln_->bias, grads.ln_bias_grad);
+
+        sgd_update(ntm_w_read_->weight, grads.ntm_read_weight_grad);
+        sgd_update(ntm_w_write_->weight, grads.ntm_write_weight_grad);
+        sgd_update(ntm_w_erase_->weight, grads.ntm_erase_weight_grad);
+
+        sgd_update(sae_w_encode_->weight, grads.sae_encode_weight_grad);
+        sgd_update(sae_w_decode_->weight, grads.sae_decode_weight_grad);
+
+        sgd_update(dw_kernel_, grads.dw_kernel_grad);
+        sgd_update(pw_conv_->weight, grads.pw_conv_weight_grad);
+        sgd_update(pw_conv_->bias, grads.pw_conv_bias_grad);
+
+        // Sparse embed update: only update rows for used token IDs
+        {
+            const auto& ids = grads.used_token_ids;
+            size_t seq_len = ids.size();
+            size_t d = config_.d_model;
+            size_t vocab_sz = config_.vocab_size;
+#ifdef USE_CUDA
+            if (CudaContext::instance().is_available() && w_embed_.is_on_gpu()) {
+                w_embed_.to_gpu();
+                grads.embed_grad.to_gpu();
+                std::vector<int> int_ids(ids.size());
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    int_ids[i] = static_cast<int>(ids[i] >= vocab_sz ? 1 : ids[i]);
+                }
+                void* d_ids = CudaContext::instance().alloc(int_ids.size() * sizeof(int));
+                CudaContext::instance().copy_h2d(d_ids, int_ids.data(), int_ids.size() * sizeof(int));
+                launch_sparse_embed_update(w_embed_.as_gpu_fp32(), grads.embed_grad.as_gpu_fp32(),
+                                           static_cast<const int*>(d_ids), static_cast<int>(seq_len),
+                                           static_cast<int>(d), lr, CudaContext::instance().stream());
+                CudaContext::instance().free(d_ids);
+                w_embed_.gpu_dirty_ = true;
+            } else
+#endif
+            {
+                float* embed_data = w_embed_.as_fp32();
+                const float* eg = grads.embed_grad.as_fp32();
+                for (size_t i = 0; i < seq_len; ++i) {
+                    size_t tid = ids[i];
+                    if (tid >= vocab_sz) continue;
+                    float* row = embed_data + tid * d;
+                    const float* grad_row = eg + i * d;
+                    for (size_t j = 0; j < d; ++j) {
+                        if (std::isfinite(grad_row[j])) row[j] -= lr * grad_row[j];
+                    }
+                }
+            }
+        }
+
+        for (size_t i = 0; i < attn_layers_.size() && i < grads.attn_grads.size(); ++i) {
+            auto& ag = grads.attn_grads[i];
+            sgd_update(attn_layers_[i]->w_qkv->weight, ag.w_qkv_weight_grad);
+            sgd_update(attn_layers_[i]->w_qkv->bias, ag.w_qkv_bias_grad);
+            sgd_update(attn_layers_[i]->w_out->weight, ag.w_out_weight_grad);
+            sgd_update(attn_layers_[i]->w_out->bias, ag.w_out_bias_grad);
+        }
+    }
+
+private:
+    Tensor ln_backward_impl(const Tensor& input, const Tensor& weight, const Tensor& output_grad, float eps = 1e-5f) {
+        size_t seq_len = input.shape_[0];
+        size_t dim = input.shape_[1];
+        Tensor input_grad({seq_len, dim}, QuantType::FP32);
+        const float* inp = input.as_fp32();
+        const float* w = weight.as_fp32();
+        const float* og = output_grad.as_fp32();
+        float* ig = input_grad.as_fp32();
+        for (size_t i = 0; i < seq_len; ++i) {
+            float mean = 0.0f;
+            for (size_t d = 0; d < dim; ++d) mean += inp[i * dim + d];
+            mean /= dim;
+            float var = 0.0f;
+            for (size_t d = 0; d < dim; ++d) { float diff = inp[i * dim + d] - mean; var += diff * diff; }
+            var /= dim;
+            float inv_std = 1.0f / std::sqrt(var + eps);
+            float sum_gn = 0.0f, sum_gnx = 0.0f;
+            for (size_t d = 0; d < dim; ++d) {
+                float norm = (inp[i * dim + d] - mean) * inv_std;
+                float gn = og[i * dim + d] * w[d];
+                sum_gn += gn; sum_gnx += gn * norm;
+            }
+            for (size_t d = 0; d < dim; ++d) {
+                float norm = (inp[i * dim + d] - mean) * inv_std;
+                float gn = og[i * dim + d] * w[d];
+                ig[i * dim + d] = inv_std * (gn - sum_gn / dim - norm * sum_gnx / dim);
+            }
+        }
+        return input_grad;
+    }
+
+    Tensor lm_head_linear_backward_input(const Tensor& output_grad, const Tensor& weight) {
+        size_t batch = output_grad.shape_[0];
+        size_t out_f = output_grad.shape_[1];
+        size_t in_f = weight.shape_[1];
+        Tensor input_grad({batch, in_f}, QuantType::FP32);
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && output_grad.is_on_gpu()) {
+            input_grad.to_gpu();
+            CudaContext::instance().sgemm_rowmajor(false, false,
+                static_cast<int>(batch), static_cast<int>(in_f), static_cast<int>(out_f),
+                1.0f, output_grad.as_gpu_fp32(), static_cast<int>(out_f),
+                weight.as_gpu_fp32(), static_cast<int>(in_f),
+                0.0f, input_grad.as_gpu_fp32(), static_cast<int>(in_f));
+            input_grad.gpu_dirty_ = true;
+            return input_grad;
+        }
+#endif
+        const float* og = output_grad.as_fp32();
+        const float* w = weight.as_fp32();
+        float* ig = input_grad.as_fp32();
+        for (size_t b = 0; b < batch; ++b) {
+            for (size_t j = 0; j < in_f; ++j) {
+                float sum = 0.0f;
+                for (size_t i = 0; i < out_f; ++i) sum += og[b * out_f + i] * w[i * in_f + j];
+                ig[b * in_f + j] = sum;
+            }
+        }
+        return input_grad;
+    }
+
+    Tensor lm_head_linear_backward_weight(const Tensor& input, const Tensor& output_grad) {
+        size_t batch = input.shape_[0];
+        size_t in_f = input.shape_[1];
+        size_t out_f = output_grad.shape_[1];
+        Tensor weight_grad({out_f, in_f}, QuantType::FP32);
+#ifdef USE_CUDA
+        if (CudaContext::instance().is_available() && input.is_on_gpu()) {
+            weight_grad.to_gpu();
+            CudaContext::instance().sgemm_rowmajor(true, false,
+                static_cast<int>(out_f), static_cast<int>(in_f), static_cast<int>(batch),
+                1.0f / batch, output_grad.as_gpu_fp32(), static_cast<int>(out_f),
+                input.as_gpu_fp32(), static_cast<int>(in_f),
+                0.0f, weight_grad.as_gpu_fp32(), static_cast<int>(in_f));
+            weight_grad.gpu_dirty_ = true;
+            return weight_grad;
+        }
+#endif
+        const float* inp = input.as_fp32();
+        const float* og = output_grad.as_fp32();
+        float* wg = weight_grad.as_fp32();
+        for (size_t i = 0; i < out_f; ++i) {
+            for (size_t j = 0; j < in_f; ++j) {
+                float sum = 0.0f;
+                for (size_t b = 0; b < batch; ++b) sum += og[b * out_f + i] * inp[b * in_f + j];
+                wg[i * in_f + j] = sum / batch;
+            }
+        }
+        return weight_grad;
+    }
+
+    Tensor lm_head_bias_backward(const Tensor& output_grad) {
+        size_t batch = output_grad.shape_[0];
+        size_t dim = output_grad.shape_[1];
+        Tensor grad({dim}, QuantType::FP32);
+        const float* og = output_grad.as_fp32();
+        float* g = grad.as_fp32();
+        for (size_t j = 0; j < dim; ++j) {
+            float sum = 0.0f;
+            for (size_t b = 0; b < batch; ++b) sum += og[b * dim + j];
+            g[j] = sum / batch;
+        }
+        return grad;
+    }
+
+public:
     void clear_cache() {
         if (kv_cache_) {
             kv_cache_->clear_cache();

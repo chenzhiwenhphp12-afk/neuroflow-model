@@ -28,9 +28,9 @@ def softmax(x):
     e = np.exp(x - x.max())
     return e / e.sum()
 
-def neuroflow_forward(token_ids, W, output_dim=128000, input_dim=512, num_layers=12, num_heads=8):
+def neuroflow_forward(token_ids, W, vocab_size=128000, hidden_dim=2048, output_dim=2048, input_dim=512, num_layers=12, num_heads=8):
     """Strict replica of model.cpp:157-268 forward_with_cache (batch=1)"""
-    vocab_scale = 1.0 / float(output_dim)
+    vocab_scale = 1.0 / float(vocab_size)
     
     # Input: [input_dim] where x[j] = token_id[j] * vocab_scale
     x = np.zeros(input_dim, dtype=np.float32)
@@ -223,7 +223,7 @@ def generate(prompt, W, vocab, id2token, max_tokens=50, temp=0.8, top_k=40, seed
 
 # ===== MAIN =====
 MODEL = '/mnt/d/neuroflow-C++/output/model_final.nfv1'
-TOK   = '/mnt/d/neuroflow-C++/configs/tokenizer_cn_013.json'
+TOK   = '/mnt/d/neuroflow-C++/configs/tokenizer_128k.json'
 
 print("⏳ 加载模型...")
 t0 = time.time()

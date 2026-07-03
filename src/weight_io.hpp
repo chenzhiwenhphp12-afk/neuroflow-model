@@ -1,14 +1,14 @@
 #ifndef NEUROFLOW_WEIGHT_IO_HPP
 #define NEUROFLOW_WEIGHT_IO_HPP
 
-#include "neuroflow/tensor.hpp"
-#include "neuroflow/model.hpp"
-#include <string>
-#include <vector>
-#include <random>
-#include <fstream>
-#include <unordered_map>
 #include <cmath>
+#include <fstream>
+#include <random>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "neuroflow/model.hpp"
+#include "neuroflow/tensor.hpp"
 
 namespace neuroflow {
 

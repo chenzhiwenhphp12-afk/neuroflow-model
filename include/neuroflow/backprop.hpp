@@ -7,18 +7,22 @@
 
 #pragma once
 
-#include "tensor.hpp"
-#include "networks.hpp"
-#include "memory.hpp"
-#include "model.hpp"
-
+// C++ 标准库
 #include <cmath>
 #include <memory>
-#include <vector>
 #include <unordered_map>
+#include <vector>
+
+// 第三方库
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+// 项目头文件
+#include "memory.hpp"
+#include "model.hpp"
+#include "networks.hpp"
+#include "tensor.hpp"
 
 namespace neuroflow {
 
@@ -478,12 +482,15 @@ public:
         Tensor h;
 
         Tensor sn_gates;
+        Tensor sn_gate_h;       // gate1 pre-gelu 输出 (修复: gelu_backward需要pre-gelu)
+        Tensor sn_gate_h_post;  // gate1 post-gelu 输出 (gate2 forward用)
 
         std::vector<Tensor> ecn_pre_linear;
         std::vector<Tensor> ecn_pre_norm;
         std::vector<Tensor> ecn_hidden;
         Tensor ecn_vmpfc_pre;
         Tensor ecn_vmpfc_d;
+        Tensor ecn_decision;  // vmpfc2 output [batch, output_dim=2048] (修复: SN gate梯度用)
         Tensor ecn_ofc_pre;
         Tensor ecn_ofc_v;
 
@@ -492,12 +499,14 @@ public:
         Tensor dmn_latent;
         std::vector<Tensor> dmn_associations;
         Tensor dmn_vision;
+        std::vector<Tensor> dmn_head1_outs;  // head1 gelu outputs (修复: 用于head2反向传播)
         Tensor memory_retrieved;
 
         Tensor combined;
         Tensor fused_pre_norm;
         Tensor fused_bn;
         Tensor fused_bn_pre_relu;
+        Tensor fused_bn_pre_norm;  // pre-norm input for bottleneck norm
         Tensor fused;
     };
 
@@ -511,11 +520,17 @@ public:
     struct Gradients {
         Tensor input_proj_weight_grad;
         Tensor input_proj_bias_grad;
+        Tensor input_proj_norm_weight_grad;
+        Tensor input_proj_norm_bias_grad;
 
         Tensor output_fusion_down_weight_grad;
         Tensor output_fusion_down_bias_grad;
         Tensor output_fusion_up_weight_grad;
         Tensor output_fusion_up_bias_grad;
+        Tensor output_fusion_norm_weight_grad;
+        Tensor output_fusion_norm_bias_grad;
+        Tensor output_fusion_bottleneck_norm_weight_grad;
+        Tensor output_fusion_bottleneck_norm_bias_grad;
 
         Tensor ecn_vmpfc2_weight_grad;
         Tensor ecn_vmpfc2_bias_grad;
@@ -524,6 +539,32 @@ public:
 
         std::vector<Tensor> ecn_dlpfc_weight_grads;
         std::vector<Tensor> ecn_dlpfc_bias_grads;
+        std::vector<Tensor> ecn_dlpfc_norm_weight_grads;
+        std::vector<Tensor> ecn_dlpfc_norm_bias_grads;
+
+        // SN gate gradients (修复: gate1/gate2 之前没有梯度)
+        Tensor sn_gate2_weight_grad;
+        Tensor sn_gate2_bias_grad;
+        Tensor sn_gate1_weight_grad;
+        Tensor sn_gate1_bias_grad;
+
+        // DMN gradients (修复: DMN 之前没有梯度)
+        Tensor dmn_future_proj1_weight_grad;
+        Tensor dmn_future_proj1_bias_grad;
+        std::vector<Tensor> dmn_head2_weight_grads;
+        std::vector<Tensor> dmn_head2_bias_grads;
+        std::vector<Tensor> dmn_head1_weight_grads;
+        std::vector<Tensor> dmn_head1_bias_grads;
+        Tensor dmn_mem_encoder2_weight_grad;
+        Tensor dmn_mem_encoder2_bias_grad;
+        Tensor dmn_mem_encoder1_weight_grad;
+        Tensor dmn_mem_encoder1_bias_grad;
+
+        // Memory gradients (修复: memory encode/query 之前没有梯度)
+        Tensor mem_encode_proj_weight_grad;
+        Tensor mem_encode_proj_bias_grad;
+        Tensor mem_query_proj_weight_grad;
+        Tensor mem_query_proj_bias_grad;
 
         Tensor input_grad;
     };
