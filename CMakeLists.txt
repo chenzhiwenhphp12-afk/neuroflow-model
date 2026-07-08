@@ -16,6 +16,7 @@ option(NEUROFLOW_BUILD_TESTS "Build unit tests" OFF)
 option(NEUROFLOW_BUILD_PYTHON "Build Python bindings" OFF)
 option(NEUROFLOW_USE_AVX2 "Enable AVX2 SIMD" ON)
 option(NEUROFLOW_USE_BLAS "Use external BLAS (OpenBLAS/MKL) for GEMM" ON)
+option(NEUROFLOW_USE_AMP "Enable mixed precision training (FP16/BF16)" OFF)
 
 if(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3 /GR /EHsc /utf-8")
@@ -49,6 +50,18 @@ add_library(neuroflow_core STATIC
     src/tensor.cpp
     src/model.cpp
     src/weight_io.cpp
+    src/tokenizer.cpp
+    src/sampling.cpp
+    src/causal_lm.cpp
+    src/tensor_ops.cpp
+    src/generative_model.cpp
+    src/rope.cpp
+    src/swiglu.cpp
+    src/rms_norm.cpp
+    src/adamw.cpp
+    src/scheduler.cpp
+    src/train_lm.cpp
+    src/grad_scaler.cpp
 )
 
 if(NEUROFLOW_USE_CUDA)
@@ -110,6 +123,15 @@ else()
     set(NEUROFLOW_BLAS_FOUND FALSE)
 endif()
 
+if(NEUROFLOW_USE_AMP)
+    if(NOT NEUROFLOW_USE_CUDA)
+        message(WARNING "NEUROFLOW_USE_AMP requires CUDA, enabling CUDA automatically")
+        set(NEUROFLOW_USE_CUDA ON)
+    endif()
+    target_compile_definitions(neuroflow_core PUBLIC NEUROFLOW_USE_AMP)
+    message(STATUS "Mixed precision training (AMP) enabled")
+endif()
+
 if(OpenMP_CXX_FOUND)
     target_link_libraries(neuroflow_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
@@ -120,11 +142,6 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(neuroflow_train_v2 PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
-add_executable(neuroflow_test_lm tests/test_lm_pathway.cpp)
-target_link_libraries(neuroflow_test_lm PRIVATE neuroflow_core)
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(neuroflow_test_lm PRIVATE OpenMP::OpenMP_CXX)
-endif()
 
 add_executable(neuroflow_infer_v2 src/infer_v2.cpp)
 target_link_libraries(neuroflow_infer_v2 PRIVATE neuroflow_core)
@@ -134,17 +151,71 @@ endif()
 
 if(NEUROFLOW_BUILD_TESTS)
     enable_testing()
+
+    set(NEUROFLOW_TEST_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+
+    add_executable(neuroflow_test_lm tests/test_lm_pathway.cpp)
+    target_link_libraries(neuroflow_test_lm PRIVATE neuroflow_core)
+    target_include_directories(neuroflow_test_lm PRIVATE ${NEUROFLOW_TEST_INCLUDE})
+    add_test(NAME lm_pathway_test COMMAND neuroflow_test_lm)
+
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tensor.cpp)
         add_executable(neuroflow_tensor_test tests/test_tensor.cpp)
         target_link_libraries(neuroflow_tensor_test PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_tensor_test PRIVATE ${NEUROFLOW_TEST_INCLUDE})
         add_test(NAME tensor_test COMMAND neuroflow_tensor_test)
     endif()
+
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_model.cpp)
         add_executable(neuroflow_model_test tests/test_model.cpp)
         target_link_libraries(neuroflow_model_test PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_model_test PRIVATE ${NEUROFLOW_TEST_INCLUDE})
         add_test(NAME model_test COMMAND neuroflow_model_test)
     endif()
-    message(STATUS "Unit tests enabled (if test files exist)")
+
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rope.cpp)
+        add_executable(neuroflow_test_rope tests/test_rope.cpp)
+        target_link_libraries(neuroflow_test_rope PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_test_rope PRIVATE ${NEUROFLOW_TEST_INCLUDE})
+        add_test(NAME rope_test COMMAND neuroflow_test_rope)
+    endif()
+
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_swiglu.cpp)
+        add_executable(neuroflow_test_swiglu tests/test_swiglu.cpp)
+        target_link_libraries(neuroflow_test_swiglu PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_test_swiglu PRIVATE ${NEUROFLOW_TEST_INCLUDE})
+        add_test(NAME swiglu_test COMMAND neuroflow_test_swiglu)
+    endif()
+
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_rms_norm.cpp)
+        add_executable(neuroflow_test_rms_norm tests/test_rms_norm.cpp)
+        target_link_libraries(neuroflow_test_rms_norm PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_test_rms_norm PRIVATE ${NEUROFLOW_TEST_INCLUDE})
+        add_test(NAME rms_norm_test COMMAND neuroflow_test_rms_norm)
+    endif()
+
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_adamw.cpp)
+        add_executable(neuroflow_test_adamw tests/test_adamw.cpp)
+        target_link_libraries(neuroflow_test_adamw PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_test_adamw PRIVATE ${NEUROFLOW_TEST_INCLUDE})
+        add_test(NAME adamw_test COMMAND neuroflow_test_adamw)
+    endif()
+
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_scheduler.cpp)
+        add_executable(neuroflow_test_scheduler tests/test_scheduler.cpp)
+        target_link_libraries(neuroflow_test_scheduler PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_test_scheduler PRIVATE ${NEUROFLOW_TEST_INCLUDE})
+        add_test(NAME scheduler_test COMMAND neuroflow_test_scheduler)
+    endif()
+
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gqa.cpp)
+        add_executable(neuroflow_test_gqa tests/test_gqa.cpp)
+        target_link_libraries(neuroflow_test_gqa PRIVATE neuroflow_core)
+        target_include_directories(neuroflow_test_gqa PRIVATE ${NEUROFLOW_TEST_INCLUDE})
+        add_test(NAME gqa_test COMMAND neuroflow_test_gqa)
+    endif()
+
+    message(STATUS "Unit tests enabled (built-in test framework)")
 endif()
 
 install(TARGETS neuroflow_core
@@ -162,9 +233,9 @@ message(STATUS "  Version:        ${PROJECT_VERSION}")
 message(STATUS "  C++ Standard:   ${CMAKE_CXX_STANDARD}")
 message(STATUS "  Build Type:     ${CMAKE_BUILD_TYPE}")
 message(STATUS "  AVX2:           ${NEUROFLOW_USE_AVX2}")
+message(STATUS "  AMP:            ${NEUROFLOW_USE_AMP}")
 message(STATUS "  Tests:          ${NEUROFLOW_BUILD_TESTS}")
 message(STATUS "  Python:         ${NEUROFLOW_BUILD_PYTHON}")
 message(STATUS "  OpenMP:         ${OpenMP_CXX_FOUND}")
 message(STATUS "  BLAS:           ${NEUROFLOW_BLAS_FOUND}")
 message(STATUS "  CUDA:           ${NEUROFLOW_CUDA_FOUND}")
-message(STATUS "")

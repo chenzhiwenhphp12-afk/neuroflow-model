@@ -403,14 +403,22 @@ bool load_lm_head(CausalLMHead& lm_head, const std::string& lm_path) {
     tensor_map["ntm_memory"] = &lm_head.ntm_memory_;
     tensor_map["w_proj.weight"] = &lm_head.w_proj_->weight;
     tensor_map["w_proj.bias"] = &lm_head.w_proj_->bias;
+    if (lm_head.bridge_) {
+        tensor_map["bridge.weight"] = &lm_head.bridge_->weight;
+        tensor_map["bridge.bias"] = &lm_head.bridge_->bias;
+    }
     tensor_map["w_out.weight"] = &lm_head.w_out_->weight;
     tensor_map["w_out.bias"] = &lm_head.w_out_->bias;
     tensor_map["ln.weight"] = &lm_head.ln_->weight;
     tensor_map["ln.bias"] = &lm_head.ln_->bias;
     for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
         std::string p = "attn" + std::to_string(i) + ".";
-        tensor_map[p + "w_qkv.weight"] = &lm_head.attn_layers_[i]->w_qkv->weight;
-        tensor_map[p + "w_qkv.bias"] = &lm_head.attn_layers_[i]->w_qkv->bias;
+        tensor_map[p + "w_q.weight"] = &lm_head.attn_layers_[i]->w_q->weight;
+        tensor_map[p + "w_q.bias"] = &lm_head.attn_layers_[i]->w_q->bias;
+        tensor_map[p + "w_k.weight"] = &lm_head.attn_layers_[i]->w_k->weight;
+        tensor_map[p + "w_k.bias"] = &lm_head.attn_layers_[i]->w_k->bias;
+        tensor_map[p + "w_v.weight"] = &lm_head.attn_layers_[i]->w_v->weight;
+        tensor_map[p + "w_v.bias"] = &lm_head.attn_layers_[i]->w_v->bias;
         tensor_map[p + "w_out.weight"] = &lm_head.attn_layers_[i]->w_out->weight;
         tensor_map[p + "w_out.bias"] = &lm_head.attn_layers_[i]->w_out->bias;
         tensor_map[p + "norm.weight"] = &lm_head.attn_layers_[i]->norm->weight;
@@ -428,6 +436,40 @@ bool load_lm_head(CausalLMHead& lm_head, const std::string& lm_path) {
                 loaded++;
             } else {
                 std::cerr << "  跳过 '" << name << "': 形状不匹配" << std::endl;
+            }
+        } else if (name.find("w_qkv.") != std::string::npos) {
+            std::string base = name.substr(0, name.find("w_qkv."));
+            std::string suffix = name.substr(name.find("w_qkv.") + 6);
+            for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
+                std::string p = "attn" + std::to_string(i) + ".";
+                if (base != p) continue;
+                size_t d_model = lm_head.config_.d_model;
+                size_t head_dim = d_model / lm_head.config_.num_attn_heads;
+                size_t n_q = lm_head.attn_layers_[i]->n_q_heads_;
+                size_t n_kv = lm_head.attn_layers_[i]->n_kv_heads_;
+                if (suffix == "weight" && tensor.shape_.size() == 2 && tensor.shape_[0] == 3 * d_model) {
+                    const float* src = tensor.as_fp32();
+                    float* dq = lm_head.attn_layers_[i]->w_q->weight.as_fp32();
+                    float* dk = lm_head.attn_layers_[i]->w_k->weight.as_fp32();
+                    float* dv = lm_head.attn_layers_[i]->w_v->weight.as_fp32();
+                    for (size_t r = 0; r < d_model; ++r) {
+                        memcpy(dq + r * n_q * head_dim, src + r * 3 * d_model, n_q * head_dim * sizeof(float));
+                        memcpy(dk + r * n_kv * head_dim, src + r * 3 * d_model + d_model, n_kv * head_dim * sizeof(float));
+                        memcpy(dv + r * n_kv * head_dim, src + r * 3 * d_model + 2 * d_model, n_kv * head_dim * sizeof(float));
+                    }
+                    loaded++;
+                    std::cerr << "  拆分旧格式 '" << name << "' -> w_q/w_k/w_v" << std::endl;
+                } else if (suffix == "bias" && tensor.shape_[0] == 3 * d_model) {
+                    const float* src = tensor.as_fp32();
+                    float* bq = lm_head.attn_layers_[i]->w_q->bias.as_fp32();
+                    float* bk = lm_head.attn_layers_[i]->w_k->bias.as_fp32();
+                    float* bv = lm_head.attn_layers_[i]->w_v->bias.as_fp32();
+                    memcpy(bq, src, n_q * head_dim * sizeof(float));
+                    memcpy(bk, src + d_model, n_kv * head_dim * sizeof(float));
+                    memcpy(bv, src + 2 * d_model, n_kv * head_dim * sizeof(float));
+                    loaded++;
+                    std::cerr << "  拆分旧格式 '" << name << "' -> w_q/w_k/w_v bias" << std::endl;
+                }
             }
         }
     }
@@ -461,13 +503,176 @@ NeuroFlowModel build_model(const NeuroFlowModel::Config& cfg, const TrainConfig&
     return model;
 }
 
+static void unescape_json(std::string& s) {
+    size_t pos = 0;
+    while ((pos = s.find('\\', pos)) != std::string::npos) {
+        if (pos + 1 < s.size()) {
+            char c = s[pos + 1];
+            if (c == 'n') { s.replace(pos, 2, "\n"); pos++; }
+            else if (c == 't') { s.replace(pos, 2, "\t"); pos++; }
+            else if (c == 'r') { s.replace(pos, 2, "\r"); pos++; }
+            else if (c == '"') { s.replace(pos, 2, "\""); pos++; }
+            else if (c == '\\') { s.replace(pos, 2, "\\"); pos++; }
+            else if (c == '/') { s.replace(pos, 2, "/"); pos++; }
+            else if (c == 'u' && pos + 5 < s.size()) { pos += 6; }
+            else { pos += 2; }
+        } else { pos++; }
+    }
+}
+
 struct LMSample {
     std::vector<size_t> token_ids;
+};
+
+struct TextSpan {
+    size_t file_index;
+    size_t offset;
+    size_t length;
 };
 
 struct TrainingSample {
     std::vector<float> input;
     std::vector<float> target;
+};
+
+class StreamingDataLoader {
+public:
+    StreamingDataLoader(const std::string& path, int batch_size,
+                        BPETokenizer* tokenizer, size_t max_seq_len = 128,
+                        size_t max_samples = 500000)
+        : batch_size_(batch_size), tokenizer_(tokenizer),
+          max_seq_len_(max_seq_len), max_samples_(max_samples),
+          current_idx_(0) {
+        index_files(path);
+        std::cerr << "StreamingDataLoader: " << spans_.size() << " 文本段已索引"
+                  << " (" << file_paths_.size() << " 文件)" << std::endl;
+    }
+
+    void index_files(const std::string& path) {
+        namespace fs = std::filesystem;
+        fs::path p(path);
+
+        if (fs::is_directory(p)) {
+            std::vector<fs::path> files;
+            for (auto& entry : fs::recursive_directory_iterator(p, fs::directory_options::follow_directory_symlink)) {
+                if (!entry.is_regular_file()) continue;
+                auto ext = entry.path().extension().string();
+                if (ext == ".txt" || ext == ".json" || ext == ".jsonl" || ext == ".csv" || ext == ".tsv") {
+                    files.push_back(entry.path());
+                }
+            }
+            std::sort(files.begin(), files.end());
+            for (auto& f : files) index_single_file(f.string());
+        } else {
+            index_single_file(p.string());
+        }
+    }
+
+    void index_single_file(const std::string& file_path) {
+        namespace fs = std::filesystem;
+        std::ifstream ifs(file_path, std::ios::binary | std::ios::ate);
+        if (!ifs) return;
+
+        size_t file_size = static_cast<size_t>(ifs.tellg());
+        ifs.seekg(0, std::ios::beg);
+
+        std::string ext = fs::path(file_path).extension().string();
+        size_t file_idx = file_paths_.size();
+        file_paths_.push_back(file_path);
+
+        if (ext == ".jsonl" || ext == ".json") {
+            std::string line;
+            size_t line_offset = 0;
+            while (std::getline(ifs, line) && spans_.size() < max_samples_) {
+                if (line.size() < 12) { line_offset += line.size() + 1; continue; }
+                std::string text = extract_text_from_line(line);
+                if (text.size() >= 10) {
+                    text_cache_.push_back(std::move(text));
+                    spans_.push_back(TextSpan{SIZE_MAX, text_cache_.size() - 1, text_cache_.back().size()});
+                }
+                line_offset += line.size() + 1;
+            }
+        } else if (ext == ".txt") {
+            std::string line;
+            while (std::getline(ifs, line) && spans_.size() < max_samples_) {
+                if (line.size() < 10) continue;
+                text_cache_.push_back(std::move(line));
+                spans_.push_back(TextSpan{SIZE_MAX, text_cache_.size() - 1, text_cache_.back().size()});
+            }
+        } else if (ext == ".csv" || ext == ".tsv") {
+            char delim = (ext == ".tsv") ? '\t' : ',';
+            std::string line;
+            while (std::getline(ifs, line) && spans_.size() < max_samples_) {
+                size_t pos = line.find(delim);
+                if (pos == std::string::npos) continue;
+                std::string text = line.substr(pos + 1);
+                if (text.size() >= 10) {
+                    text_cache_.push_back(std::move(text));
+                    spans_.push_back(TextSpan{SIZE_MAX, text_cache_.size() - 1, text_cache_.back().size()});
+                }
+            }
+        }
+    }
+
+    std::string extract_text_from_line(const std::string& line) {
+        const char* fields[] = {"\"text\"", "\"content\"", "\"title\"", "\"question\"", "\"answer\""};
+        for (auto& field : fields) {
+            size_t pos = line.find(field);
+            if (pos == std::string::npos) continue;
+            size_t colon = line.find(':', pos + strlen(field));
+            if (colon == std::string::npos) continue;
+            size_t q1 = line.find('"', colon);
+            if (q1 == std::string::npos) continue;
+            size_t q2 = line.find('"', q1 + 1);
+            if (q2 == std::string::npos) continue;
+            std::string text = line.substr(q1 + 1, q2 - q1 - 1);
+            unescape_json(text);
+            return text;
+        }
+        return "";
+    }
+
+    LMSample get(size_t idx) const {
+        if (idx >= spans_.size()) return {};
+        const auto& span = spans_[idx];
+        const std::string& text = text_cache_[span.offset];
+        auto ids = tokenizer_->encode(text, max_seq_len_);
+        return LMSample{std::move(ids)};
+    }
+
+    bool has_next() const { return current_idx_ < spans_.size(); }
+
+    std::vector<LMSample> next_lm_batch_raw() {
+        std::vector<LMSample> batch;
+        for (int i = 0; i < batch_size_ && current_idx_ < spans_.size(); ++i) {
+            batch.push_back(get(current_idx_++));
+        }
+        return batch;
+    }
+
+    void reset() { current_idx_ = 0; }
+
+    void shuffle(std::mt19937& rng) {
+        std::shuffle(spans_.begin(), spans_.end(), rng);
+    }
+
+    size_t total_samples() const { return spans_.size(); }
+
+    size_t memory_usage_bytes() const {
+        size_t total = spans_.capacity() * sizeof(TextSpan);
+        for (auto& t : text_cache_) total += t.capacity();
+        return total;
+    }
+
+private:
+    int batch_size_;
+    BPETokenizer* tokenizer_;
+    size_t max_seq_len_;
+    size_t max_samples_;
+    size_t current_idx_;
+    std::vector<std::string> file_paths_;
+    std::vector<TextSpan> spans_;
+    std::vector<std::string> text_cache_;
 };
 
 class DataLoader {
@@ -1012,22 +1217,7 @@ public:
     lm_samples_.push_back(LMSample{std::move(ids)});
     }
 
-    static void unescape_json(std::string& s) {
-        size_t pos = 0;
-        while ((pos = s.find('\\', pos)) != std::string::npos) {
-            if (pos + 1 < s.size()) {
-                char c = s[pos + 1];
-                if (c == 'n') { s.replace(pos, 2, "\n"); pos++; }
-                else if (c == 't') { s.replace(pos, 2, "\t"); pos++; }
-                else if (c == 'r') { s.replace(pos, 2, "\r"); pos++; }
-                else if (c == '"') { s.replace(pos, 2, "\""); pos++; }
-                else if (c == '\\') { s.replace(pos, 2, "\\"); pos++; }
-                else if (c == '/') { s.replace(pos, 2, "/"); pos++; }
-                else if (c == 'u' && pos + 5 < s.size()) { pos += 6; }
-                else { pos += 2; }
-            } else { pos++; }
-        }
-    }
+    static void unescape_json_static(std::string& s) { unescape_json(s); }
 
     bool has_next() const {
         if (mode_ == Mode::LM) return current_idx_ < lm_samples_.size();
@@ -1269,13 +1459,21 @@ void train_loop(NeuroFlowModel& model, CausalLMHead& lm_head, DataLoader& loader
         sync_to_cpu(lm_head.ntm_memory_);
         sync_to_cpu(lm_head.w_proj_->weight);
         sync_to_cpu(lm_head.w_proj_->bias);
+        if (lm_head.bridge_) {
+            sync_to_cpu(lm_head.bridge_->weight);
+            sync_to_cpu(lm_head.bridge_->bias);
+        }
         sync_to_cpu(lm_head.w_out_->weight);
         sync_to_cpu(lm_head.w_out_->bias);
         sync_to_cpu(lm_head.ln_->weight);
         sync_to_cpu(lm_head.ln_->bias);
         for (auto& attn : lm_head.attn_layers_) {
-            sync_to_cpu(attn->w_qkv->weight);
-            sync_to_cpu(attn->w_qkv->bias);
+            sync_to_cpu(attn->w_q->weight);
+            sync_to_cpu(attn->w_q->bias);
+            sync_to_cpu(attn->w_k->weight);
+            sync_to_cpu(attn->w_k->bias);
+            sync_to_cpu(attn->w_v->weight);
+            sync_to_cpu(attn->w_v->bias);
             sync_to_cpu(attn->w_out->weight);
             sync_to_cpu(attn->w_out->bias);
             sync_to_cpu(attn->norm->weight);
@@ -1303,14 +1501,22 @@ void train_loop(NeuroFlowModel& model, CausalLMHead& lm_head, DataLoader& loader
         sl(o, "ntm_memory", lm_head.ntm_memory_);
         sl(o, "w_proj.weight", lm_head.w_proj_->weight);
         sl(o, "w_proj.bias", lm_head.w_proj_->bias);
+        if (lm_head.bridge_) {
+            sl(o, "bridge.weight", lm_head.bridge_->weight);
+            sl(o, "bridge.bias", lm_head.bridge_->bias);
+        }
         sl(o, "w_out.weight", lm_head.w_out_->weight);
         if (lm_head.w_out_->bias.data_) sl(o, "w_out.bias", lm_head.w_out_->bias);
         sl(o, "ln.weight", lm_head.ln_->weight);
         sl(o, "ln.bias", lm_head.ln_->bias);
         for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
             std::string p = "attn" + std::to_string(i) + ".";
-            sl(o, p + "w_qkv.weight", lm_head.attn_layers_[i]->w_qkv->weight);
-            sl(o, p + "w_qkv.bias", lm_head.attn_layers_[i]->w_qkv->bias);
+            sl(o, p + "w_q.weight", lm_head.attn_layers_[i]->w_q->weight);
+            sl(o, p + "w_q.bias", lm_head.attn_layers_[i]->w_q->bias);
+            sl(o, p + "w_k.weight", lm_head.attn_layers_[i]->w_k->weight);
+            sl(o, p + "w_k.bias", lm_head.attn_layers_[i]->w_k->bias);
+            sl(o, p + "w_v.weight", lm_head.attn_layers_[i]->w_v->weight);
+            sl(o, p + "w_v.bias", lm_head.attn_layers_[i]->w_v->bias);
             sl(o, p + "w_out.weight", lm_head.attn_layers_[i]->w_out->weight);
             sl(o, p + "w_out.bias", lm_head.attn_layers_[i]->w_out->bias);
             sl(o, p + "norm.weight", lm_head.attn_layers_[i]->norm->weight);
@@ -1318,6 +1524,8 @@ void train_loop(NeuroFlowModel& model, CausalLMHead& lm_head, DataLoader& loader
         }
         uint32_t z = 0; o.write((char*)&z, 4); o.close();
     };
+
+    lm_head.train();
 
     for (int epoch = start_epoch; epoch < cfg.epochs; ++epoch) {
         auto epoch_start = std::chrono::steady_clock::now();
@@ -1593,8 +1801,12 @@ int main(int argc, char* argv[]) {
         lm_head.ln_->weight.to_gpu();
         lm_head.ln_->bias.to_gpu();
         for (auto& attn : lm_head.attn_layers_) {
-            attn->w_qkv->weight.to_gpu();
-            attn->w_qkv->bias.to_gpu();
+            attn->w_q->weight.to_gpu();
+            attn->w_q->bias.to_gpu();
+            attn->w_k->weight.to_gpu();
+            attn->w_k->bias.to_gpu();
+            attn->w_v->weight.to_gpu();
+            attn->w_v->bias.to_gpu();
             attn->w_out->weight.to_gpu();
             attn->w_out->bias.to_gpu();
             attn->norm->weight.to_gpu();

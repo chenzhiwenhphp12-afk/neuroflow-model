@@ -11,6 +11,19 @@
 
 namespace neuroflow {
 
+__device__ inline void safe_atomic_max_float(float* addr, float val) {
+    unsigned int old = atomicCAS(reinterpret_cast<unsigned int*>(addr),
+                                  __float_as_uint(val),
+                                  __float_as_uint(val));
+    while (val > __uint_as_float(old)) {
+        unsigned int assumed = old;
+        old = atomicCAS(reinterpret_cast<unsigned int*>(addr),
+                         assumed,
+                         __float_as_uint(val));
+        if (old == assumed) break;
+    }
+}
+
 // ═══════════════════════════════════════════════════════
 // CUDA Kernel 实现
 // ═══════════════════════════════════════════════════════
@@ -100,7 +113,7 @@ __global__ void kernel_softmax_impl(float* data, int rows, int cols) {
     __shared__ float s_max;
     if (threadIdx.x == 0) s_max = -1e30f;
     __syncthreads();
-    atomicMax(reinterpret_cast<int*>(&s_max), __float_as_int(max_val));
+    safe_atomic_max_float(&s_max, max_val);
     __syncthreads();
     max_val = s_max;
 
@@ -146,7 +159,7 @@ __global__ void kernel_causal_softmax_impl(float* data, int seq_len) {
     __shared__ float s_max;
     if (threadIdx.x == 0) s_max = -1e30f;
     __syncthreads();
-    atomicMax(reinterpret_cast<int*>(&s_max), __float_as_int(max_val));
+    safe_atomic_max_float(&s_max, max_val);
     __syncthreads();
     max_val = s_max;
 
@@ -295,7 +308,7 @@ __global__ void kernel_cross_entropy_impl(float* loss, const float* logits, int 
     }
     if (threadIdx.x == 0) s_max = -1e30f;
     __syncthreads();
-    atomicMax(reinterpret_cast<int*>(&s_max), __float_as_int(local_max));
+    safe_atomic_max_float(&s_max, local_max);
     __syncthreads();
 
     float local_sum = 0.0f;
@@ -328,7 +341,7 @@ __global__ void kernel_cross_entropy_backward_impl(float* grad, const float* log
     }
     if (threadIdx.x == 0) s_max = -1e30f;
     __syncthreads();
-    atomicMax(reinterpret_cast<int*>(&s_max), __float_as_int(local_max));
+    safe_atomic_max_float(&s_max, local_max);
     __syncthreads();
 
     float local_sum = 0.0f;
@@ -600,6 +613,22 @@ inline void launch_extract_qkv(float* d_Q_h, float* d_K_h, float* d_V_h,
     kernel_extract_qkv_impl<<<grid, block, 0, stream>>>(d_Q_h, d_K_h, d_V_h, d_qkv, seq_len, d_model, head_dim, h);
 }
 
+__global__ void kernel_extract_head_impl(float* out, const float* src, int seq_len, int n_heads, int head_dim, int h) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = seq_len * head_dim;
+    if (idx >= total) return;
+    int i = idx / head_dim;
+    int d = idx % head_dim;
+    out[i * head_dim + d] = src[i * n_heads * head_dim + h * head_dim + d];
+}
+
+inline void launch_extract_head(float* out, const float* src, int seq_len, int n_heads, int head_dim, int h, cudaStream_t stream) {
+    int total = seq_len * head_dim;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    kernel_extract_head_impl<<<grid, block, 0, stream>>>(out, src, seq_len, n_heads, head_dim, h);
+}
+
 // --- Extract per-head attn_out_grad ---
 __global__ void kernel_extract_attn_out_grad_impl(float* aog_h, const float* aog, int seq_len, int d_model, int head_dim, int h) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -629,7 +658,7 @@ __global__ void kernel_ntm_softmax_impl(float* data, int batch, int slots) {
     __shared__ float s_max;
     if (threadIdx.x == 0) s_max = -1e30f;
     __syncthreads();
-    atomicMax(reinterpret_cast<int*>(&s_max), __float_as_int(max_val));
+    safe_atomic_max_float(&s_max, max_val);
     __syncthreads();
 
     float sum = 0.0f;
@@ -834,6 +863,287 @@ inline void launch_sgd_update_clipped(float* d_param, const float* d_grad, size_
     int block = 256;
     int grid = (static_cast<int>(n) + block - 1) / block;
     kernel_sgd_update_clipped_impl<<<grid, block, 0, stream>>>(d_param, d_grad, n, lr, clip_scale);
+}
+
+// --- Padding Mask Generation ---
+__global__ void kernel_padding_mask_impl(float* mask, const int* token_ids, int seq_len, int padding_id) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= seq_len) return;
+    mask[idx] = (token_ids[idx] == padding_id) ? 0.0f : 1.0f;
+}
+
+inline void launch_padding_mask(float* d_mask, const int* d_token_ids, int seq_len, int padding_id, cudaStream_t stream) {
+    int block = 256;
+    int grid = (seq_len + block - 1) / block;
+    kernel_padding_mask_impl<<<grid, block, 0, stream>>>(d_mask, d_token_ids, seq_len, padding_id);
+}
+
+// --- Fused Causal + Padding Mask (applied to attention scores before softmax) ---
+// Sets attn_scores[i][j] = -inf if (j > i) OR (padding_mask[j] == 0)
+__global__ void kernel_fused_causal_padding_mask_impl(float* attn_scores, const float* padding_mask,
+                                                       int seq_len, int n_heads) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_heads * seq_len * seq_len;
+    if (idx >= total) return;
+    int h = idx / (seq_len * seq_len);
+    int rem = idx % (seq_len * seq_len);
+    int i = rem / seq_len;
+    int j = rem % seq_len;
+    if (j > i || padding_mask[j] == 0.0f) {
+        attn_scores[idx] = -1e30f;
+    }
+}
+
+inline void launch_fused_causal_padding_mask(float* d_attn_scores, const float* d_padding_mask,
+                                              int seq_len, int n_heads, cudaStream_t stream) {
+    int total = n_heads * seq_len * seq_len;
+    int block = 256;
+    int grid = (total + block - 1) / block;
+    kernel_fused_causal_padding_mask_impl<<<grid, block, 0, stream>>>(d_attn_scores, d_padding_mask, seq_len, n_heads);
+}
+
+
+// --- GPU Top-K/Top-P Sampling ---
+// Performs temperature scaling, top-k filtering, top-p filtering, softmax, and sampling
+// entirely on GPU. Only the sampled token ID is copied back to CPU.
+// Uses a simple deterministic pseudo-random based on block/thread index + seed.
+
+__global__ void kernel_topk_topp_sampling_impl(
+    const float* d_logits, int* d_output_token,
+    int vocab_size, int top_k, float top_p, float temperature,
+    unsigned int seed, int num_candidates) {
+
+    extern __shared__ float smem[];
+
+    float* sm_scores = smem;
+    int* sm_indices = (int*)(sm_scores + num_candidates);
+
+    int tid = threadIdx.x;
+
+    for (int i = tid; i < num_candidates; ++i) {
+        sm_scores[i] = -1e30f;
+        sm_indices[i] = 0;
+    }
+    __syncthreads();
+
+    for (int i = tid; i < vocab_size; i += blockDim.x) {
+        float val = d_logits[i] / temperature;
+        if (val > sm_scores[num_candidates - 1]) {
+            int pos = num_candidates - 1;
+            while (pos > 0 && val > sm_scores[pos - 1]) {
+                sm_scores[pos] = sm_scores[pos - 1];
+                sm_indices[pos] = sm_indices[pos - 1];
+                pos--;
+            }
+            sm_scores[pos] = val;
+            sm_indices[pos] = i;
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        int k = min(top_k, vocab_size);
+        k = min(k, num_candidates);
+
+        float max_val = sm_scores[0];
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            sm_scores[i] = expf(sm_scores[i] - max_val);
+            sum += sm_scores[i];
+        }
+        for (int i = 0; i < k; ++i) {
+            sm_scores[i] /= sum;
+        }
+
+        float cumulative = 0.0f;
+        int top_p_cutoff = k;
+        for (int i = 0; i < k; ++i) {
+            cumulative += sm_scores[i];
+            if (cumulative >= top_p) {
+                top_p_cutoff = i + 1;
+                break;
+            }
+        }
+
+        float renorm_sum = 0.0f;
+        for (int i = 0; i < top_p_cutoff; ++i) {
+            renorm_sum += sm_scores[i];
+        }
+
+        unsigned int rng_state = seed + blockIdx.x * 12345;
+        rng_state = rng_state * 1103515245 + 12345;
+        float r = ((rng_state >> 16) & 0x7fff) / 32768.0f;
+
+        float threshold = r * renorm_sum;
+        cumulative = 0.0f;
+        int chosen = 0;
+        for (int i = 0; i < top_p_cutoff; ++i) {
+            cumulative += sm_scores[i];
+            if (cumulative >= threshold) {
+                chosen = sm_indices[i];
+                break;
+            }
+        }
+
+        *d_output_token = chosen;
+    }
+}
+
+inline bool launch_topk_topp_sampling(const float* d_logits, int* d_output_token,
+                                       int vocab_size, int top_k, float top_p,
+                                       float temperature, unsigned int seed,
+                                       cudaStream_t stream) {
+    int num_candidates = min(top_k, vocab_size);
+    num_candidates = max(num_candidates, 1);
+
+    int block = 256;
+    size_t smem_size = sizeof(float) * num_candidates + sizeof(int) * num_candidates;
+
+    if (smem_size > 48 * 1024) {
+        return false;
+    }
+
+    kernel_topk_topp_sampling_impl<<<1, block, smem_size, stream>>>(
+        d_logits, d_output_token, vocab_size, top_k, top_p, temperature, seed, num_candidates);
+
+    return true;
+}
+
+// --- FP16/BF16 Conversion Kernels ---
+
+__global__ void kernel_fp32_to_fp16(uint16_t* out, const float* in, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = __float2half(in[idx]);
+}
+
+__global__ void kernel_fp16_to_fp32(float* out, const uint16_t* in, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = __half2float(in[idx]);
+}
+
+__global__ void kernel_fp32_to_bf16(uint16_t* out, const float* in, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    uint32_t bits;
+    memcpy(&bits, &in[idx], 4);
+    out[idx] = static_cast<uint16_t>(bits >> 16);
+}
+
+__global__ void kernel_bf16_to_fp32(float* out, const uint16_t* in, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    uint32_t bits = static_cast<uint32_t>(in[idx]) << 16;
+    memcpy(&out[idx], &bits, 4);
+}
+
+inline void launch_fp32_to_fp16(uint16_t* d_out, const float* d_in, size_t n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (static_cast<int>(n) + block - 1) / block;
+    kernel_fp32_to_fp16<<<grid, block, 0, stream>>>(d_out, d_in, n);
+}
+
+inline void launch_fp16_to_fp32(float* d_out, const uint16_t* d_in, size_t n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (static_cast<int>(n) + block - 1) / block;
+    kernel_fp16_to_fp32<<<grid, block, 0, stream>>>(d_out, d_in, n);
+}
+
+inline void launch_fp32_to_bf16(uint16_t* d_out, const float* d_in, size_t n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (static_cast<int>(n) + block - 1) / block;
+    kernel_fp32_to_bf16<<<grid, block, 0, stream>>>(d_out, d_in, n);
+}
+
+inline void launch_bf16_to_fp32(float* d_out, const uint16_t* d_in, size_t n, cudaStream_t stream) {
+    int block = 256;
+    int grid = (static_cast<int>(n) + block - 1) / block;
+    kernel_bf16_to_fp32<<<grid, block, 0, stream>>>(d_out, d_in, n);
+}
+
+// --- Flash Attention (Tiled Online Softmax) ---
+
+template<int BLOCK_SIZE = 64, int HEAD_DIM = 64>
+__global__ void kernel_flash_attention_forward(
+    const float* Q, const float* K, const float* V,
+    float* O, int seq_len, float scale) {
+
+    int h = blockIdx.x;
+    int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i >= seq_len) return;
+
+    extern __shared__ char smem[];
+    float* s_K = reinterpret_cast<float*>(smem);
+    float* s_V = reinterpret_cast<float*>(smem + BLOCK_SIZE * HEAD_DIM * sizeof(float));
+
+    float m = -1e30f;
+    float l = 0.0f;
+    float o[HEAD_DIM];
+    for (int d = 0; d < HEAD_DIM; ++d) o[d] = 0.0f;
+
+    const float* q_row = Q + (h * seq_len + i) * HEAD_DIM;
+
+    for (int jb = 0; jb < seq_len; jb += BLOCK_SIZE) {
+        int j_end = min(jb + BLOCK_SIZE, seq_len);
+
+        for (int j = threadIdx.x; j < (j_end - jb) * HEAD_DIM; j += blockDim.x) {
+            int jj = j / HEAD_DIM;
+            int dd = j % HEAD_DIM;
+            s_K[jj * HEAD_DIM + dd] = K[(h * seq_len + jb + jj) * HEAD_DIM + dd];
+            s_V[jj * HEAD_DIM + dd] = V[(h * seq_len + jb + jj) * HEAD_DIM + dd];
+        }
+        __syncthreads();
+
+        for (int jj = 0; jj < (j_end - jb); ++jj) {
+            int j = jb + jj;
+            if (j > i) break;
+
+            float dot = 0.0f;
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                dot += q_row[d] * s_K[jj * HEAD_DIM + d];
+            }
+            dot *= scale;
+
+            float m_new = max(m, dot);
+            float l_new = expf(m - m_new) * l + expf(dot - m_new);
+
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                o[d] = expf(m - m_new) * o[d] + expf(dot - m_new) * s_V[jj * HEAD_DIM + d];
+            }
+            m = m_new;
+            l = l_new;
+        }
+        __syncthreads();
+    }
+
+    if (l > 0.0f) {
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            O[(h * seq_len + i) * HEAD_DIM + d] = o[d] / l;
+        }
+    } else {
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            O[(h * seq_len + i) * HEAD_DIM + d] = 0.0f;
+        }
+    }
+}
+
+inline void launch_flash_attention(const float* d_Q, const float* d_K, const float* d_V,
+                                   float* d_O, int n_heads, int seq_len,
+                                   int head_dim, float scale, cudaStream_t stream) {
+    dim3 grid(n_heads, (seq_len + 63) / 64);
+    int block = 64;
+    size_t smem = 64 * head_dim * 2 * sizeof(float);
+    if (head_dim <= 64) {
+        kernel_flash_attention_forward<64, 64><<<grid, block, smem, stream>>>(
+            d_Q, d_K, d_V, d_O, seq_len, scale);
+    } else if (head_dim <= 128) {
+        kernel_flash_attention_forward<64, 128><<<grid, block, smem, stream>>>(
+            d_Q, d_K, d_V, d_O, seq_len, scale);
+    } else {
+        kernel_flash_attention_forward<64, 256><<<grid, block, smem, stream>>>(
+            d_Q, d_K, d_V, d_O, seq_len, scale);
+    }
 }
 
 } // namespace neuroflow

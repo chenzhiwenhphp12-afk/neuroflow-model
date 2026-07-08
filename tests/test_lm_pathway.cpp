@@ -94,7 +94,9 @@ int main() {
     check_nan("pw_conv_weight_grad", grads.pw_conv_weight_grad);
     check_nan("embed_grad", grads.embed_grad);
     if (!grads.attn_grads.empty()) {
-        check_nan("attn0.w_qkv_weight_grad", grads.attn_grads[0].w_qkv_weight_grad);
+        check_nan("attn0.w_q_weight_grad", grads.attn_grads[0].w_q_weight_grad);
+        check_nan("attn0.w_k_weight_grad", grads.attn_grads[0].w_k_weight_grad);
+        check_nan("attn0.w_v_weight_grad", grads.attn_grads[0].w_v_weight_grad);
         check_nan("attn0.w_out_weight_grad", grads.attn_grads[0].w_out_weight_grad);
         check_nan("attn0.input_grad", grads.attn_grads[0].input_grad);
     }
@@ -148,8 +150,12 @@ int main() {
         sl(o, "ln.bias", lm_head.ln_->bias);
         for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
             std::string p = "attn" + std::to_string(i) + ".";
-            sl(o, p + "w_qkv.weight", lm_head.attn_layers_[i]->w_qkv->weight);
-            sl(o, p + "w_qkv.bias", lm_head.attn_layers_[i]->w_qkv->bias);
+            sl(o, p + "w_q.weight", lm_head.attn_layers_[i]->w_q->weight);
+            sl(o, p + "w_q.bias", lm_head.attn_layers_[i]->w_q->bias);
+            sl(o, p + "w_k.weight", lm_head.attn_layers_[i]->w_k->weight);
+            sl(o, p + "w_k.bias", lm_head.attn_layers_[i]->w_k->bias);
+            sl(o, p + "w_v.weight", lm_head.attn_layers_[i]->w_v->weight);
+            sl(o, p + "w_v.bias", lm_head.attn_layers_[i]->w_v->bias);
             sl(o, p + "w_out.weight", lm_head.attn_layers_[i]->w_out->weight);
             sl(o, p + "w_out.bias", lm_head.attn_layers_[i]->w_out->bias);
             sl(o, p + "norm.weight", lm_head.attn_layers_[i]->norm->weight);

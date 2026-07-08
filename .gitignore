@@ -64,3 +64,4 @@ configs/*.local*
 # Output
 output/
 tok1_data/
+data/distill_train.txt

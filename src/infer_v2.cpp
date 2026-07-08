@@ -17,7 +17,11 @@ int main(int argc, char* argv[]) {
     int max_new_tokens = 64;
     float temperature = 0.8f;
     int top_k = 40;
+    float top_p = 0.9f;
+    float repetition_penalty = 1.0f;
     bool use_cuda = false;
+    std::string strategy_name = "top_k";
+    int yarn_max_seq_len = -1;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -27,6 +31,10 @@ int main(int argc, char* argv[]) {
         else if (arg == "--max-tokens" && i + 1 < argc) max_new_tokens = std::atoi(argv[++i]);
         else if (arg == "--temperature" && i + 1 < argc) temperature = std::atof(argv[++i]);
         else if (arg == "--top-k" && i + 1 < argc) top_k = std::atoi(argv[++i]);
+        else if (arg == "--top-p" && i + 1 < argc) top_p = std::atof(argv[++i]);
+        else if (arg == "--repetition-penalty" && i + 1 < argc) repetition_penalty = std::atof(argv[++i]);
+        else if (arg == "--strategy" && i + 1 < argc) strategy_name = argv[++i];
+        else if (arg == "--max-seq-len" && i + 1 < argc) yarn_max_seq_len = std::atoi(argv[++i]);
         else if (arg == "--use-cuda") use_cuda = true;
     }
 
@@ -128,8 +136,12 @@ int main(int argc, char* argv[]) {
         tensor_map["ln.bias"] = &lm_head.ln_->bias;
         for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
             std::string p = "attn" + std::to_string(i) + ".";
-            tensor_map[p + "w_qkv.weight"] = &lm_head.attn_layers_[i]->w_qkv->weight;
-            tensor_map[p + "w_qkv.bias"] = &lm_head.attn_layers_[i]->w_qkv->bias;
+            tensor_map[p + "w_q.weight"] = &lm_head.attn_layers_[i]->w_q->weight;
+            tensor_map[p + "w_q.bias"] = &lm_head.attn_layers_[i]->w_q->bias;
+            tensor_map[p + "w_k.weight"] = &lm_head.attn_layers_[i]->w_k->weight;
+            tensor_map[p + "w_k.bias"] = &lm_head.attn_layers_[i]->w_k->bias;
+            tensor_map[p + "w_v.weight"] = &lm_head.attn_layers_[i]->w_v->weight;
+            tensor_map[p + "w_v.bias"] = &lm_head.attn_layers_[i]->w_v->bias;
             tensor_map[p + "w_out.weight"] = &lm_head.attn_layers_[i]->w_out->weight;
             tensor_map[p + "w_out.bias"] = &lm_head.attn_layers_[i]->w_out->bias;
             tensor_map[p + "norm.weight"] = &lm_head.attn_layers_[i]->norm->weight;
@@ -159,6 +171,38 @@ int main(int argc, char* argv[]) {
             if (it != tensor_map.end() && it->second->shape_ == t.shape_) {
                 memcpy(it->second->data_.get(), t.data_.get(), t.data_size_);
                 loaded++;
+            } else if (name.find("w_qkv.") != std::string::npos) {
+                std::string base = name.substr(0, name.find("w_qkv."));
+                std::string suffix = name.substr(name.find("w_qkv.") + 6);
+                for (size_t i = 0; i < lm_head.attn_layers_.size(); ++i) {
+                    std::string p = "attn" + std::to_string(i) + ".";
+                    if (base != p) continue;
+                    size_t d_model = lm_head.config_.d_model;
+                    size_t head_dim = d_model / lm_head.config_.num_attn_heads;
+                    size_t n_q = lm_head.attn_layers_[i]->n_q_heads_;
+                    size_t n_kv = lm_head.attn_layers_[i]->n_kv_heads_;
+                    if (suffix == "weight" && t.shape_.size() == 2 && t.shape_[0] == 3 * d_model) {
+                        const float* src = t.as_fp32();
+                        float* dq = lm_head.attn_layers_[i]->w_q->weight.as_fp32();
+                        float* dk = lm_head.attn_layers_[i]->w_k->weight.as_fp32();
+                        float* dv = lm_head.attn_layers_[i]->w_v->weight.as_fp32();
+                        for (size_t r = 0; r < d_model; ++r) {
+                            memcpy(dq + r * n_q * head_dim, src + r * 3 * d_model, n_q * head_dim * sizeof(float));
+                            memcpy(dk + r * n_kv * head_dim, src + r * 3 * d_model + d_model, n_kv * head_dim * sizeof(float));
+                            memcpy(dv + r * n_kv * head_dim, src + r * 3 * d_model + 2 * d_model, n_kv * head_dim * sizeof(float));
+                        }
+                        loaded++;
+                    } else if (suffix == "bias" && t.shape_[0] == 3 * d_model) {
+                        const float* src = t.as_fp32();
+                        float* bq = lm_head.attn_layers_[i]->w_q->bias.as_fp32();
+                        float* bk = lm_head.attn_layers_[i]->w_k->bias.as_fp32();
+                        float* bv = lm_head.attn_layers_[i]->w_v->bias.as_fp32();
+                        memcpy(bq, src, n_q * head_dim * sizeof(float));
+                        memcpy(bk, src + d_model, n_kv * head_dim * sizeof(float));
+                        memcpy(bv, src + 2 * d_model, n_kv * head_dim * sizeof(float));
+                        loaded++;
+                    }
+                }
             }
         }
         ifs.close();
@@ -193,8 +237,12 @@ int main(int argc, char* argv[]) {
             lm_head.ln_->weight.to_gpu();
             lm_head.ln_->bias.to_gpu();
             for (auto& attn : lm_head.attn_layers_) {
-                attn->w_qkv->weight.to_gpu();
-                attn->w_qkv->bias.to_gpu();
+                attn->w_q->weight.to_gpu();
+                attn->w_q->bias.to_gpu();
+                attn->w_k->weight.to_gpu();
+                attn->w_k->bias.to_gpu();
+                attn->w_v->weight.to_gpu();
+                attn->w_v->bias.to_gpu();
                 attn->w_out->weight.to_gpu();
                 attn->w_out->bias.to_gpu();
                 attn->norm->weight.to_gpu();
@@ -218,6 +266,13 @@ int main(int argc, char* argv[]) {
         use_cuda = false;
     }
 #endif
+
+    lm_head.eval();
+
+    if (yarn_max_seq_len > 0 && static_cast<size_t>(yarn_max_seq_len) > lm_cfg.max_seq_len) {
+        float scale_factor = static_cast<float>(yarn_max_seq_len) / static_cast<float>(lm_cfg.max_seq_len);
+        lm_head.set_yarn_scale(scale_factor);
+    }
 
     std::cerr << "\n=== NeuroFlow 推理模式 ===" << std::endl;
     std::cerr << "输入提示（Ctrl+C退出）:" << std::endl;
@@ -250,41 +305,64 @@ int main(int argc, char* argv[]) {
         std::vector<size_t> generated;
         size_t last_id = token_ids.back();
 
+        GenerateConfig gen_cfg;
+        gen_cfg.max_new_tokens = static_cast<size_t>(max_new_tokens);
+        gen_cfg.temperature = temperature;
+        gen_cfg.top_k = static_cast<size_t>(top_k);
+        gen_cfg.top_p = top_p;
+        gen_cfg.repetition_penalty = repetition_penalty;
+        gen_cfg.eos_id = 0;
+
+        std::unique_ptr<SamplingStrategy> sampler;
+        if (strategy_name == "greedy") {
+            sampler = std::make_unique<GreedyDecoding>();
+        } else if (strategy_name == "top_p") {
+            sampler = std::make_unique<TopPSampling>();
+        } else if (strategy_name == "top_k_top_p") {
+            sampler = std::make_unique<TopKTopPSampling>();
+        } else {
+            sampler = std::make_unique<TopKSampling>();
+        }
+
         for (int step = 0; step < max_new_tokens; ++step) {
             size_t pos = token_ids.size() - 1 + step;
             logits = lm_head.forward_step(last_id, pos);
 
 #ifdef USE_CUDA
             if (cuda_active && logits.is_on_gpu()) {
+                int d_sampled_token = 0;
+                int h_sampled_token = 0;
+                cudaMalloc(&d_sampled_token, sizeof(int));
+
+                unsigned int seed = static_cast<unsigned int>(step * 7919 + 42);
+                bool ok = launch_topk_topp_sampling(
+                    logits.as_gpu_fp32(), d_sampled_token,
+                    static_cast<int>(lm_cfg.vocab_size),
+                    top_k, top_p, temperature, seed,
+                    CudaContext::instance().stream());
+
+                if (ok) {
+                    CudaContext::instance().synchronize();
+                    cudaMemcpy(&h_sampled_token, d_sampled_token, sizeof(int), cudaMemcpyDeviceToHost);
+                    cudaFree(d_sampled_token);
+
+                    size_t chosen = static_cast<size_t>(h_sampled_token);
+                    generated.push_back(chosen);
+                    last_id = chosen;
+
+                    if (chosen == 0 || chosen == 1) break;
+                    continue;
+                } else {
+                    cudaFree(d_sampled_token);
+                    std::cerr << "[INFER WARNING] GPU sampling failed, falling back to CPU sampling" << std::endl;
+                }
+
                 logits.to_cpu();
             }
 #endif
 
-            const float* pred = logits.as_fp32();
-            size_t vocab_sz = lm_cfg.vocab_size;
-
-            float max_val = -1e30f;
-            for (size_t j = 0; j < vocab_sz; ++j) {
-                if (pred[j] > max_val) max_val = pred[j];
-            }
-
-            std::vector<std::pair<float, size_t>> scored;
-            float sum_exp = 0.0f;
-            for (size_t j = 0; j < vocab_sz; ++j) {
-                float val = std::exp((pred[j] - max_val) / temperature);
-                sum_exp += val;
-                scored.emplace_back(val, j);
-            }
-
-            std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-
-            float cumsum = 0.0f;
-            size_t k = std::min(static_cast<size_t>(top_k), scored.size());
-            std::discrete_distribution<size_t> dist;
-            std::vector<float> weights(k);
-            for (size_t i = 0; i < k; ++i) weights[i] = scored[i].first / sum_exp;
-            std::discrete_distribution<size_t> topk_dist(weights.begin(), weights.end());
-            size_t chosen = scored[topk_dist(rng)].second;
+            Tensor probs = sampler->apply(std::move(logits), gen_cfg, generated);
+            size_t chosen = sampler->sample(probs, rng);
 
             generated.push_back(chosen);
             last_id = chosen;
