@@ -75,7 +75,7 @@ if(NEUROFLOW_USE_CUDA)
     target_sources(neuroflow_core PRIVATE src/cuda_context.cpp)
     set_source_files_properties(src/cuda_context.cpp PROPERTIES LANGUAGE CUDA)
     target_compile_options(neuroflow_core PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_86,code=[sm_86,compute_86]>
+        $<$<COMPILE_LANGUAGE:CUDA>:--generate-code=arch=compute_80,code=[sm_80,compute_80]>
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
         $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
     )

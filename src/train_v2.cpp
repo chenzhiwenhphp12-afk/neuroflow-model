@@ -163,16 +163,16 @@ struct TrainConfig {
     std::string data_path;
     std::string output_dir = "./output";
     int epochs = 10;
-    float learning_rate = 3e-5f;
+    float learning_rate = 1e-4f;
     uint32_t seed = 42;
     std::string resume_path = "";
     std::string init_strategy = "xavier";
-    int batch_size = 256;
+    int batch_size = 32;
     int log_interval = 50;
     int save_interval = 5000;
-    float grad_clip = 4.0f;
+    float grad_clip = 1.0f;
     bool use_adam = false;
-    int grad_accum_steps = 1;
+    int grad_accum_steps = 4;
     std::string vocab_mask_path = "";
     int replay_buffer_size = 10000;
     float replay_ratio = 0.25f;
@@ -289,8 +289,14 @@ NeuroFlowModel::Config load_model_config(const std::string& json_path) {
     cfg.max_seq_len = extract_json_number(json, "max_seq_len", cfg.max_seq_len);
     cfg.causal_window_size = extract_json_number(json, "causal_window_size", cfg.causal_window_size);
     cfg.lm_num_attn_layers = extract_json_number(json, "lm_num_attn_layers", cfg.lm_num_attn_layers);
+    cfg.lm_num_attn_heads = extract_json_number(json, "lm_num_attn_heads", cfg.lm_num_attn_heads);
+    cfg.lm_n_kv_heads = extract_json_number(json, "lm_n_kv_heads", cfg.lm_n_kv_heads);
+    cfg.lm_use_rope = extract_json_bool(json, "lm_use_rope", cfg.lm_use_rope);
+    cfg.lm_use_qk_norm = extract_json_bool(json, "lm_use_qk_norm", cfg.lm_use_qk_norm);
+    cfg.lm_use_swiglu = extract_json_bool(json, "lm_use_swiglu", cfg.lm_use_swiglu);
+    cfg.lm_use_bridge = extract_json_bool(json, "lm_use_bridge", cfg.lm_use_bridge);
     cfg.lm_pooling = extract_json_string(json, "lm_pooling");
-    if (cfg.lm_pooling.empty()) cfg.lm_pooling = "mean";
+    if (cfg.lm_pooling.empty()) cfg.lm_pooling = "last";
 
     std::cerr << "配置加载: " << json_path << std::endl;
     std::cerr << "  d_model=" << cfg.input_dim << " hidden_dim=" << cfg.hidden_dim
@@ -1762,7 +1768,12 @@ int main(int argc, char* argv[]) {
     lm_cfg.mla_max_cache_len = 4096;
     lm_cfg.weight_tying = true;
     lm_cfg.num_attn_layers = model_cfg.lm_num_attn_layers;
-    lm_cfg.num_attn_heads = 4;
+    lm_cfg.num_attn_heads = model_cfg.lm_num_attn_heads;
+    lm_cfg.n_kv_heads = model_cfg.lm_n_kv_heads;
+    lm_cfg.use_rope = model_cfg.lm_use_rope;
+    lm_cfg.use_qk_norm = model_cfg.lm_use_qk_norm;
+    lm_cfg.use_swiglu = model_cfg.lm_use_swiglu;
+    lm_cfg.use_bridge = model_cfg.lm_use_bridge;
     lm_cfg.pooling = model_cfg.lm_pooling;
     CausalLMHead lm_head(lm_cfg);
     if (lm_cfg.weight_tying) lm_head.tie_weights();

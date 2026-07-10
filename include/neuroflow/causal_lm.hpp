@@ -26,13 +26,13 @@ enum class FinishReason : uint8_t {
 
 struct CausalLMConfig {
     size_t vocab_size = 128000;
-    size_t d_model = 256;
-    size_t max_seq_len = 128;
+    size_t d_model = 512;
+    size_t max_seq_len = 512;
     size_t causal_window_size = 32;
-    size_t sae_k = 64;
-    size_t ntm_memory_slots = 16;
+    size_t sae_k = 128;
+    size_t ntm_memory_slots = 32;
     bool use_mla = true;
-    size_t mla_latent_dim = 32;
+    size_t mla_latent_dim = 64;
     size_t mla_n_heads = 8;
     size_t mla_max_cache_len = 4096;
     bool use_quantization = false;
@@ -42,9 +42,9 @@ struct CausalLMConfig {
     bool use_swiglu = true;
     size_t swiglu_intermediate_size = 0;
     bool use_qk_norm = true;
-    size_t num_attn_layers = 2;
-    size_t num_attn_heads = 4;
-    size_t n_kv_heads = 0;
+    size_t num_attn_layers = 4;
+    size_t num_attn_heads = 8;
+    size_t n_kv_heads = 2;
     int padding_id = -1;
     std::string pooling = "last";
 };
